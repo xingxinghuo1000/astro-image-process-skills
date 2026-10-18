@@ -60,6 +60,7 @@ python -m venv .venv
 - `--save-frames` — 另存每帧对齐后的全分辨率 TIFF（较占空间）。
 - `--exclude 6007,6012` — 剔除个别帧。
 - `--neutralize` — **背景中性化**（类 PixInsight `BackgroundNeutralization`）：按通道测量天空背景并缩放到中性灰，消除偏色（如光害导致的紫/绿底）。作用于拉伸后的图像。
+- `--flat` — **自动平场 / 背景梯度去除**（类 PixInsight `AutomaticBackgroundExtractor` ABE）：把图像分成网格、每格取低分位数估计天空背景，拟合一张低阶二维多项式背景面并按通道扣除（只扣除梯度的"形状"，保留暗天空基座，避免把背景压到 0）。**作用于拉伸前的线性图**：梯度在线性域是加性的，拟合/扣除才有物理意义；放到拉伸后会失真并干扰自动拉伸的背景定位。可调 `--flat-mode subtract|divide`、`--flat-bins`、`--flat-degree`、`--flat-pct`。
 - `--star-reduce PX` — **缩星**（类 PixInsight `StarReduction`）：高通星点掩膜下的形态学腐蚀，把星点半径缩小约 PX 像素（推荐 1~3），背景与银河不受影响，让星云/银河更突出。0 为关闭。
 - `--save-stages` — **分阶段输出**：把每个处理阶段各存一张图（16-bit TIFF + 半尺寸 JPEG 预览），都在 `--out` 目录里。
 
@@ -72,10 +73,10 @@ python -m venv .venv
 | `stretched_preview.jpg` / `stack_preview.jpg` | 预览图 |
 | `transforms.json` | 每帧的相似变换、内点数、评分 |
 | `star_mask.png` | 星点掩膜（使用 `--star-reduce` 时输出，便于检查） |
-| `stage1_stacked.tif` / `stage2_stretched.tif` / `stage3_neutralized.tif` / `stage4_star_reduced.tif` | 各处理阶段（需 `--save-stages`，同名 `_preview.jpg` 为预览） |
+| `stageN_*.tif`（如 `stage1_stacked` / `stage2_flat` / `stage3_stretched` / `stage4_neutralized` / `stage5_star_reduced`） | 各处理阶段（需 `--save-stages`，同名 `_preview.jpg` 为预览；编号按实际启用的步骤递增） |
 | `aligned/IMG_xxxx.tif` | 每帧对齐结果（需 `--save-frames`） |
 
-处理阶段顺序：**叠加 → 拉伸 → 中性化 → 缩星**（后面的阶段可关闭）。
+处理阶段顺序：**叠加 → 自动平场 → 拉伸 → 中性化 → 缩星**（平场/中性化/缩星均可关闭）。
 
 ## 注意
 

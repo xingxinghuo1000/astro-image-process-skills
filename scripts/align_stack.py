@@ -17,15 +17,20 @@ Method
 4. Write an adaptive brightness-stretched copy (auto MTF) so faint structure
    such as the Milky Way is visible.
 
-4b. Optional post-processing, PixInsight style, applied in stages:
-    stage1  linear stacked image
-    stage2  adaptive stretch (auto MTF)
-    stage3  background neutralization -- equalize the per-channel sky background
-            to a neutral grey (PixInsight BackgroundNeutralization), via
-            --neutralize
-    stage4  star reduction -- erode the stars under a high-pass star mask so they
-            shrink without touching the background / Milky Way, via
-            --star-reduce PX
+4b. Optional post-processing, PixInsight style, applied in stages (each enabled
+    step adds a stage; the stretch is always applied):
+    stacked      linear stacked image
+    flat         auto flat -- fit and subtract the smooth per-channel background
+                 gradient (light pollution / vignetting / airglow), PixInsight
+                 AutomaticBackgroundExtractor style; runs on the LINEAR image,
+                 where gradients are additive, i.e. before the stretch, via
+                 --flat
+    stretched    adaptive stretch (auto MTF)
+    neutralized  equalize the per-channel sky background to a neutral grey
+                 (PixInsight BackgroundNeutralization), via --neutralize
+    star_reduced erode the stars under a high-pass star mask so they shrink
+                 without touching the background / Milky Way, via
+                 --star-reduce PX
 
 Outputs (in --out):
     transforms.json                       per-frame similarity transforms
@@ -245,9 +250,67 @@ def background_neutralize(rgb, bg_pct=0.5):
     they all match the average reference (a pure grey).  Applied on linear data."""
     ref = background_reference(rgb, bg_pct)
     target = float(ref.mean())
+    if target < 1e-6:
+        return rgb, ref, np.ones(3)
     gains = target / np.maximum(ref, 1e-6)
     out = np.clip(rgb * gains[None, None, :], 0, 1)
     return out, ref, gains
+
+
+def auto_flat(rgb, bins=16, degree=3, pct=25.0, mode="subtract"):
+    """Remove the smooth low-frequency background, PixInsight
+    AutomaticBackgroundExtractor (ABE, a.k.a. "auto flat") style.
+
+    Splits the image into a grid of tiles, estimates each tile's sky level with a
+    low percentile (robust to the sparse stars), fits a 2D polynomial surface per
+    channel through those tile levels, then subtracts (or divides by) the model.
+    Run on LINEAR data, where gradients (light pollution, vignetting, airglow)
+    are additive and therefore physically meaningful to fit.  The polynomial is
+    deliberately low order so the narrow Milky Way is *not* absorbed.
+
+    In `subtract` mode only the gradient *shape* is removed: a pedestal at the
+    model's 10th percentile (the dark-sky level) is kept so the background is not
+    floored to zero, which would clip the sky noise and starve later steps."""
+    h, w = rgb.shape[:2]
+    nx = max(2, int(bins))
+    ny = max(2, int(round(bins * h / w)))
+    xs = ((np.arange(nx) + 0.5) / nx) * 2.0 - 1.0
+    ys = ((np.arange(ny) + 0.5) / ny) * 2.0 - 1.0
+    terms = [(i, j) for i in range(degree + 1) for j in range(degree + 1)
+             if i + j <= degree]
+    A = np.empty((nx * ny, len(terms)), np.float64)
+    for yi in range(ny):
+        for xi in range(nx):
+            for t, (i, j) in enumerate(terms):
+                A[yi * nx + xi, t] = (xs[xi] ** i) * (ys[yi] ** j)
+    xe = np.linspace(0, w, nx + 1).astype(int)
+    ye = np.linspace(0, h, ny + 1).astype(int)
+    gx = (np.linspace(0, w - 1, w) / max(w - 1, 1)) * 2.0 - 1.0
+    gy = (np.linspace(0, h - 1, h) / max(h - 1, 1)) * 2.0 - 1.0
+
+    out = rgb.copy()
+    info = []
+    for c in range(3):
+        vals = np.empty(nx * ny, np.float64)
+        for yi in range(ny):
+            for xi in range(nx):
+                tile = rgb[ye[yi]:ye[yi + 1], xe[xi]:xe[xi + 1], c]
+                vals[yi * nx + xi] = np.percentile(tile, pct) if tile.size else 0.0
+        coef = np.linalg.lstsq(A, vals, rcond=None)[0]
+        model = np.zeros((h, w), np.float32)
+        for (i, j), cc in zip(terms, coef):
+            model += cc * ((gy ** j)[:, None] * (gx ** i)[None, :])
+        if mode == "divide":
+            out[..., c] = np.clip(rgb[..., c] / np.maximum(model, 1e-6), 0, 1)
+        else:
+            # Subtract only the gradient *shape*: keep a pedestal at the model's
+            # 10th percentile (the dark-sky level) so flat regions are not
+            # floored to zero -- otherwise the whole background clips and later
+            # steps break.
+            ped = max(0.0, float(np.percentile(model, 10.0)))
+            out[..., c] = np.clip(rgb[..., c] - np.clip(model - ped, 0, None), 0, 1)
+        info.append((float(model.min()), float(model.max()), float(model.mean())))
+    return out, info
 
 
 def make_star_mask(lum, sigma=12.0, nsigma=5.0, grow=2.0):
@@ -322,10 +385,27 @@ def main():
                     help="shrink stars by PX pixels with a morphology + star-mask "
                          "step applied to the stretched image (PixInsight "
                          "StarReduction style); 0 disables (default)")
+    ap.add_argument("--flat", action="store_true",
+                    help="remove the smooth background gradient on the LINEAR "
+                         "image before stretching (PixInsight "
+                         "AutomaticBackgroundExtractor / 'auto flat')")
+    ap.add_argument("--flat-mode", choices=["subtract", "divide"],
+                    default="subtract",
+                    help="subtract the fitted background (light-pollution / "
+                         "airglow gradients, default) or divide by it "
+                         "(vignetting-style flat)")
+    ap.add_argument("--flat-bins", type=int, default=16,
+                    help="grid columns for the background model (default 16)")
+    ap.add_argument("--flat-degree", type=int, default=3,
+                    help="2D polynomial degree of the background surface "
+                         "(default 3)")
+    ap.add_argument("--flat-pct", type=float, default=25.0,
+                    help="per-tile background percentile (default 25; low keeps "
+                         "the estimate robust to stars)")
     ap.add_argument("--save-stages", action="store_true",
-                    help="write every pipeline stage as its own image: "
-                         "stage1_stacked, stage2_stretched[, stage3_neutralized]"
-                         "[, stage4_star_reduced] (16-bit TIFF + JPEG preview)")
+                    help="write every pipeline stage as its own image: stacked, "
+                         "optional flat, stretched, optional neutralized / "
+                         "star_reduced (16-bit TIFF + JPEG preview)")
     args = ap.parse_args()
 
     os.makedirs(args.out, exist_ok=True)
@@ -472,22 +552,42 @@ def main():
             stack[r0:r1] = np.median(block, axis=0)
 
     # ---- staged post-processing -------------------------------------------------
-    # stage 1: the linear stacked image
-    stages = [("stage1_stacked", stack)]
+    # Each enabled step appends a stage; the number reflects the real order so
+    # the flattened output of the linear master is always stage1's successor.
+    stages = []
 
-    # stage 2: adaptive brightness stretch (auto MTF), so faint structure shows
-    ys, mtf_m, bg = auto_stretch(stack, target_bg=args.stretch_bg)
-    stages.append(("stage2_stretched", ys))
+    def add_stage(name, img):
+        stages.append((f"stage{len(stages) + 1}_{name}", img))
 
-    # stage 3: background neutralization -- scale each channel so the sky
+    # stage: the linear stacked image
+    linear = stack
+    add_stage("stacked", linear)
+
+    # stage: auto flat (ABE) -- fit and subtract the smooth per-channel
+    # background gradient on the LINEAR image, where gradients are additive,
+    # i.e. before the nonlinear stretch.
+    if args.flat:
+        linear, finfo = auto_flat(linear, bins=args.flat_bins,
+                                  degree=args.flat_degree, pct=args.flat_pct,
+                                  mode=args.flat_mode)
+        log("  auto-flat (ABE, %s): model level " % args.flat_mode
+            + ", ".join("ch%d=%.4f..%.4f" % (c, mn, mx)
+                        for c, (mn, mx, _) in enumerate(finfo)))
+        add_stage("flat", linear)
+
+    # stage: adaptive brightness stretch (auto MTF), so faint structure shows
+    ys, mtf_m, bg = auto_stretch(linear, target_bg=args.stretch_bg)
+    add_stage("stretched", ys)
+
+    # stage: background neutralization -- scale each channel so the sky
     # background becomes a neutral grey (PixInsight BackgroundNeutralization).
     if args.neutralize:
         ys, sref, sgain = background_neutralize(ys)
         log(f"  neutralized background: ref={np.round(sref, 4).tolist()} "
             f"gains={np.round(sgain, 4).tolist()}")
-        stages.append(("stage3_neutralized", ys))
+        add_stage("neutralized", ys)
 
-    # stage 4: star reduction -- shrink stars under a high-pass star mask.
+    # stage: star reduction -- shrink stars under a high-pass star mask.
     if args.star_reduce > 0:
         ys, star_mask = reduce_stars(ys, amount=args.star_reduce)
         m8 = (np.clip(star_mask, 0, 1) * 255).astype(np.uint8)
@@ -495,7 +595,7 @@ def main():
                     cv2.cvtColor(m8, cv2.COLOR_GRAY2BGR))
         log(f"  stars reduced by {args.star_reduce:g}px "
             f"(mask {100.0 * (star_mask > 0.05).mean():.2f}% of frame)")
-        stages.append(("stage4_star_reduced", ys))
+        add_stage("star_reduced", ys)
 
     if args.save_stages:
         log("  writing per-stage images ...")
@@ -504,10 +604,10 @@ def main():
 
     # ---- main deliverables (linear master + finished stretched image) ----
     stack_path = os.path.join(args.out, f"stack_{args.method}.tif")
-    write_tiff16(stack_path, np.clip(stack * 65535.0, 0, 65535).astype(np.uint16))
+    write_tiff16(stack_path, np.clip(linear * 65535.0, 0, 65535).astype(np.uint16))
     log(f"  wrote {stack_path}")
 
-    prev = stretch_preview(stack)
+    prev = stretch_preview(linear)
     prev = cv2.resize(prev, None, fx=0.5, fy=0.5, interpolation=cv2.INTER_AREA)
     cv2.imwrite(os.path.join(args.out, "stack_preview.jpg"),
                 cv2.cvtColor(prev, cv2.COLOR_RGB2BGR), [cv2.IMWRITE_JPEG_QUALITY, 92])
