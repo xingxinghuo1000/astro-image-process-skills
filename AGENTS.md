@@ -37,6 +37,25 @@ Guidance for AI coding agents working in this repository.
 - Input CR2 frames live outside the repo (e.g. `D:\pic\...`); do not copy them in.
 - Outputs go to `--out` (default `out/`), which is git-ignored.
 
+## C++ port
+
+- `cpp/` re-implements `scripts/align_stack.py` (same algorithm, same CLI) with
+  no OpenCV dependency; the only external dep is the vendored LibRaw under
+  `cpp/third_party/` (LibRaw + its CMake wrapper).
+- Build (Windows, MSVC + Ninja from `.venv`):
+  ```bat
+  cpp\build.bat            :: Release (default)
+  cpp\build.bat Debug
+  ```
+  Produces `output/astro_align.exe`. It is a portable CMake project, so on
+  other platforms: `cmake -S cpp -B cpp/build -DCMAKE_BUILD_TYPE=Release` then
+  `cmake --build cpp/build -j`.
+- Run (arguments mirror the Python script):
+  ```bat
+  output\astro_align.exe --dir "D:\pic\DCIM-2026\08-shangduhu-2" --start 5994 --end 6012 --out out_cpp --ref 6003 --method median
+  ```
+- `output/`, `cpp/build/` are build artifacts (git-ignored); never commit them.
+
 ## Conventions
 
 - No comments unless they explain non-obvious *why* (the alignment pipeline has

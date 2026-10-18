@@ -2,9 +2,14 @@
 __pycache__/
 *.pyc
 out/
+out_cpp*/
 _dbg/
 _test/
-_smoke/
+_smoke*/
 *.tif
 *.tiff
 *.dat
+*.log
+# C++ build artifacts
+output/
+cpp/build/
