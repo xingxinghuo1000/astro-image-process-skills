@@ -366,18 +366,19 @@ def write_flat_compare(stack_lin, flat_lin, target_bg, neutralize, out_dir,
 def make_star_mask(lum, sigma=12.0, nsigma=5.0, grow=2.0):
     """Soft mask covering stars (not the large-scale Milky Way / foreground).
 
-    A high-pass isolates small bright blobs (stars + their halos) from the
-    smooth background; a noise-robust `mean + nsigma*std` threshold (as used for
-    star detection) zeroes the background, and the ramp up to a high percentile
-    is grown/blurred so the morphology below also reshapes the halo."""
+    A high-pass isolates small bright blobs (stars + their halos) from the smooth
+    background; a noise-robust `mean + nsigma*std` threshold keeps the stars, the
+    binary mask is then dilated by `grow` px -- so it also covers the pixels the
+    erosion will pull in -- and slightly blurred for soft edges.  A percentile
+    ramp instead of a hard threshold leaves typical stars almost unmasked (only
+    the 99.9th percentile reaches ~1), which makes the reduction invisible."""
     hp = np.clip(lum - cv2.GaussianBlur(lum, (0, 0), sigma), 0, None)
     thr = float(hp.mean()) + nsigma * float(hp.std())
-    hi = float(np.percentile(hp, 99.9))
-    if hi <= thr:
-        hi = thr + 1e-6
-    mask = np.clip((hp - thr) / (hi - thr), 0, 1)
+    mask = (hp > thr).astype(np.float32)
     if grow > 0:
-        mask = cv2.GaussianBlur(mask, (0, 0), grow)
+        k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE,
+                                      (2 * int(grow) + 1, 2 * int(grow) + 1))
+        mask = cv2.GaussianBlur(cv2.dilate(mask, k), (0, 0), 1.5)
     return np.clip(mask, 0, 1)
 
 
