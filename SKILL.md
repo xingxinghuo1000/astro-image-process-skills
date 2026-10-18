@@ -72,16 +72,16 @@ python -m venv .venv
 
 ## 输出（在 `--out` 目录）
 
-> **每个阶段都会输出中间结果**：`stageN_<name>.tif`（16-bit TIFF）+ 同名 `_preview.jpg`（半尺寸预览），编号按实际启用的步骤递增；并把**所有阶段拼接成一张对比图** `stages_montage.jpg`（线性阶段会自动拉伸后展示，便于和后续阶段比较）。
+> **每个阶段都会输出中间结果**：`stageN_<name>.tif`（16-bit TIFF）+ 同名 `_preview.jpg`（半尺寸预览），`Num`（即 `N`）就是该阶段的序号，按实际启用的步骤递增；并把**所有阶段拼接成一张对比图** `stages_montage.jpg`（线性阶段会自动拉伸后展示，便于和后续阶段比较）。
 
 | 文件 | 说明 |
 | --- | --- |
-| `stageN_<name>.tif` + `_preview.jpg` | **每个处理阶段的中间结果**（TIFF + 预览）。如 `stage1_stacked` / `stage2_flat` / `stage3_stretched` / `stage4_neutralized` / `stage5_star_reduced` |
+| `stageN_<name>.tif` + `_preview.jpg` | **每个处理阶段的中间结果**（TIFF + 预览），`N` 为该阶段序号。如 `stage1_stacked` / `stage2_composite` / `stage3_flat` / `stage4_stretched` / `stage5_neutralized` / `stage6_star_reduced` |
 | `stages_montage.jpg` | **各阶段成果多图拼接对比图**（全部阶段并排，带标签） |
+| `merge_final_<start>_<end>.tif` | **最终成品**：16-bit TIFF（完整分辨率）。`<start>`/`<end>` 为**合并序列的起始/结束帧号**，如 `merge_final_5994_6012.tif` |
+| `merge_final_<start>_<end>.jpg` | **最终成品**：JPEG（完整分辨率） |
 | `stack_<method>.tif` | 对齐叠加后的**线性** 16-bit 主图（供后期） |
-| `stack_<method>_stretched.tif` | 最终成品：16-bit TIFF（完整分辨率） |
-| `stack_<method>_stretched.jpg` | 最终成品：JPEG（完整分辨率） |
-| `stretched_preview.jpg` / `stack_preview.jpg` | 半尺寸预览图 |
+| `stack_preview.jpg` | 线性主图的半尺寸预览 |
 | `transforms.json` | 每帧的相似变换、内点数、评分 |
 | `star_mask.png` | 星点掩膜（使用 `--star-reduce` 时输出，便于检查） |
 | `flat_compare.jpg` | 平场对比图（使用 `--flat` 时输出）：不平场 vs 平场（可含 `--flat-sweep` 强度扫描），**交给用户目视决定是否采用/选用哪个强度** |
@@ -91,7 +91,7 @@ python -m venv .venv
 
 处理阶段顺序：**叠加 → 天地合成 → 自动平场 → 拉伸 → 中性化 → 缩星**（合成/平场/中性化/缩星均可关闭）。
 
-**最终出图**：成品同时输出**完整分辨率的 TIFF 和 JPEG**（`stack_<method>_stretched.tif` / `.jpg`），可直接交付。
+**最终出图**：成品同时输出**完整分辨率的 TIFF 和 JPEG**，命名为 `merge_final_<start>_<end>.tif` / `.jpg`（`<start>`/`<end>` 是合并序列的起始/结束帧号），可直接交付；其余中间结果一律以 `stageN_` 开头。
 
 ## 平场工作流（对比 → 用户决策）
 

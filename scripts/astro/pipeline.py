@@ -274,27 +274,28 @@ def run(args):
     montage = render.write_montage(args.out, stages, target_bg=args.stretch_bg)
     log(f"  wrote {montage}  (all stages side by side)")
 
-    # ---- final deliverables (linear master + finished image, TIFF and JPEG) ----
+    # ---- final deliverables: the finished image, named for the merged range --
+    # Final products are merge_final_<start>_<end>.tif/.jpg (the frame numbers
+    # of the merged sequence); every intermediate is a stageN_* file.
+    first_id, last_id = files[0][0], files[-1][0]
+    final_base = f"merge_final_{first_id}_{last_id}"
+
     stack_path = os.path.join(args.out, f"stack_{args.method}.tif")
     imgio.write_tiff16(stack_path, np.clip(linear * 65535.0, 0, 65535).astype(np.uint16))
-    log(f"  wrote {stack_path}")
+    log(f"  wrote {stack_path} (linear master)")
 
     prev = stretch.stretch_preview(linear)
     prev = cv2.resize(prev, None, fx=0.5, fy=0.5, interpolation=cv2.INTER_AREA)
     cv2.imwrite(os.path.join(args.out, "stack_preview.jpg"),
                 cv2.cvtColor(prev, cv2.COLOR_RGB2BGR), [cv2.IMWRITE_JPEG_QUALITY, 92])
 
-    st_path = os.path.join(args.out, f"stack_{args.method}_stretched.tif")
-    imgio.write_tiff16(st_path, (ys * 65535.0).astype(np.uint16))
-    cv2.imwrite(os.path.join(args.out, f"stack_{args.method}_stretched.jpg"),
+    final_tif = os.path.join(args.out, final_base + ".tif")
+    final_jpg = os.path.join(args.out, final_base + ".jpg")
+    imgio.write_tiff16(final_tif, (ys * 65535.0).astype(np.uint16))
+    cv2.imwrite(final_jpg,
                 cv2.cvtColor((np.clip(ys, 0, 1) * 255 + 0.5).astype(np.uint8),
                              cv2.COLOR_RGB2BGR), [cv2.IMWRITE_JPEG_QUALITY, 95])
-    ys_prev = cv2.resize((ys * 255).astype(np.uint8), None, fx=0.5, fy=0.5,
-                         interpolation=cv2.INTER_AREA)
-    cv2.imwrite(os.path.join(args.out, "stretched_preview.jpg"),
-                cv2.cvtColor(ys_prev, cv2.COLOR_RGB2BGR),
-                [cv2.IMWRITE_JPEG_QUALITY, 92])
-    log(f"  wrote {st_path} + stack_{args.method}_stretched.jpg (full-res)"
+    log(f"  wrote {final_tif} + {final_base}.jpg (full-res)"
         f"  (auto-stretch: mtf_m={mtf_m:.4f}, bg={bg:.4f}, target={args.stretch_bg})")
 
     with open(os.path.join(args.out, "transforms.json"), "w") as f:
