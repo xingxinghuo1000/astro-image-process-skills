@@ -21,7 +21,17 @@ description: >-
 
 ## 环境
 
-始终使用仓库根目录的虚拟环境 `.venv/`（Windows）：
+> **注意**：本技能所在的目录（存放 `SKILL.md`、`scripts/` 的安装位置）**不一定等于**
+> 当前工作目录。不要默认 `.venv` 就在技能目录旁边——它更可能位于**工作目录**。
+
+选择 Python 解释器的顺序：
+
+1. **优先在工作目录**查找已存在的虚拟环境，依次尝试
+   `.venv/`、`venv/`（Windows：`Scripts\python.exe`；POSIX：`bin/python`）。
+   用 `pyvenv.cfg` 是否存在，或
+   `python -c "import sys; print(sys.prefix != sys.base_prefix)"` 返回 `True`
+   来确认它**确实是一个 Python 虚拟环境**；是则**直接用**，不要再建新的。
+2. 若工作目录里没有可用的虚拟环境，就在**工作目录**创建 `.venv/` 并安装依赖：
 
 ```bash
 python -m venv .venv
@@ -29,10 +39,14 @@ python -m venv .venv
     -i https://mirrors.aliyun.com/pypi/simple/ --trusted-host mirrors.aliyun.com
 ```
 
+（`requirements.txt` 用技能目录里的那份；Aliyun 镜像在国内快很多。）
+
 ## 运行
 
+下面示例以工作目录下已存在 `.venv`（Windows）为前提，脚本路径指向本技能目录：
+
 ```bash
-./.venv/Scripts/python.exe scripts/align_stack.py \
+./.venv/Scripts/python.exe <skill-dir>/scripts/align_stack.py \
     --dir "D:\pic\DCIM-2026\08-shangduhu-2" \
     --start 5994 --end 6012 \
     --out out --method median
