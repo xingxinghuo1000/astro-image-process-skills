@@ -340,12 +340,13 @@ def _product_preview(lin, target_bg, neutralize, scale=0.5):
 
 
 def write_flat_compare(stack_lin, flat_lin, target_bg, neutralize, out_dir,
-                       sweep=(), scale=0.5):
+                       sweep=(), applied=1.0, scale=0.5):
     """Side-by-side stretched previews -- no-flat vs auto-flat, plus an optional
     strength sweep -- so the user can judge whether the flat helps and pick a
     `--flat-strength`.  The flat is a judgement call (it removes the light-
     pollution gradient but can carve the glow of a frame-filling Milky Way), so
-    the pipeline always writes this figure whenever --flat is used."""
+    the pipeline always writes this figure whenever --flat is used.  With no
+    sweep the second panel shows the strength actually applied."""
     def blend(s):
         return np.clip(stack_lin + s * (flat_lin - stack_lin), 0, 1)
     panels = [("no flat", _product_preview(stack_lin, target_bg, neutralize, scale))]
@@ -353,7 +354,8 @@ def write_flat_compare(stack_lin, flat_lin, target_bg, neutralize, out_dir,
         panels.append(("flat s=%.2f" % s,
                        _product_preview(blend(s), target_bg, neutralize, scale)))
     if not sweep:
-        panels.append(("auto flat", _product_preview(flat_lin, target_bg, neutralize, scale)))
+        panels.append(("flat s=%.1f" % applied,
+                       _product_preview(blend(applied), target_bg, neutralize, scale)))
     row = np.hstack([_label(im, t) for t, im in panels])
     path = os.path.join(out_dir, "flat_compare.jpg")
     cv2.imwrite(path, cv2.cvtColor(row, cv2.COLOR_RGB2BGR),
@@ -655,7 +657,8 @@ def main():
         add_stage("flat", linear)
         sweep = [float(x) for x in args.flat_sweep.split(",") if x.strip()]
         cmp_path = write_flat_compare(stack, flat_full, args.stretch_bg,
-                                     args.neutralize, args.out, sweep)
+                                     args.neutralize, args.out, sweep,
+                                     applied=args.flat_strength)
         log(f"  wrote {cmp_path}  (no flat vs auto flat"
             + ("" if not sweep else " vs strength sweep " + args.flat_sweep) + ")")
 
