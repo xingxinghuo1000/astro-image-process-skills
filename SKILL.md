@@ -60,7 +60,8 @@ python -m venv .venv
 - `--save-frames` — 另存每帧对齐后的全分辨率 TIFF（较占空间）。
 - `--exclude 6007,6012` — 剔除个别帧。
 - `--neutralize` — **背景中性化**（类 PixInsight `BackgroundNeutralization`）：按通道测量天空背景并缩放到中性灰，消除偏色（如光害导致的紫/绿底）。作用于拉伸后的图像。
-- `--flat` — **自动平场 / 背景梯度去除**（类 PixInsight `AutomaticBackgroundExtractor` ABE）：把图像分成网格、每格取低分位数估计天空背景，拟合一张低阶二维多项式背景面并按通道扣除（只扣除梯度的"形状"，保留暗天空基座，避免把背景压到 0）。**作用于拉伸前的线性图**：梯度在线性域是加性的，拟合/扣除才有物理意义；放到拉伸后会失真并干扰自动拉伸的背景定位。可调 `--flat-mode subtract|divide`、`--flat-bins`、`--flat-degree`、`--flat-pct`。
+- `--flat` — **自动平场 / 背景梯度去除**（类 PixInsight `AutomaticBackgroundExtractor` ABE）：把图像分成网格、每格取低分位数估计天空背景，拟合一张低阶二维多项式背景面并按通道扣除（只扣除梯度的"形状"，保留暗天空基座，避免把背景压到 0）。**作用于拉伸前的线性图**：梯度在线性域是加性的，拟合/扣除才有物理意义；放到拉伸后会失真并干扰自动拉伸的背景定位。可调 `--flat-mode subtract|divide`、`--flat-bins`、`--flat-degree`、`--flat-pct`、`--flat-strength`。
+  - ⚠️ **外圈亮环**：若画面被银河/大范围辉光铺满，低阶背景模型分不清"天空背景"和"目标本身的辉光"，满强度扣除会把中心压暗、边缘相对变亮，出现一圈亮环。此时把 `--flat-strength` 调到 ~0.3~0.5（默认 1.0）即可在保留梯度去除的同时消除亮环。
 - `--star-reduce PX` — **缩星**（类 PixInsight `StarReduction`）：高通星点掩膜下的形态学腐蚀，把星点半径缩小约 PX 像素（推荐 1~3），背景与银河不受影响，让星云/银河更突出。0 为关闭。
 - `--save-stages` — **分阶段输出**：把每个处理阶段各存一张图（16-bit TIFF + 半尺寸 JPEG 预览），都在 `--out` 目录里。
 

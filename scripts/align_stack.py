@@ -257,7 +257,7 @@ def background_neutralize(rgb, bg_pct=0.5):
     return out, ref, gains
 
 
-def auto_flat(rgb, bins=16, degree=3, pct=25.0, mode="subtract"):
+def auto_flat(rgb, bins=16, degree=3, pct=25.0, mode="subtract", strength=1.0):
     """Remove the smooth low-frequency background, PixInsight
     AutomaticBackgroundExtractor (ABE, a.k.a. "auto flat") style.
 
@@ -270,7 +270,13 @@ def auto_flat(rgb, bins=16, degree=3, pct=25.0, mode="subtract"):
 
     In `subtract` mode only the gradient *shape* is removed: a pedestal at the
     model's 10th percentile (the dark-sky level) is kept so the background is not
-    floored to zero, which would clip the sky noise and starve later steps."""
+    floored to zero, which would clip the sky noise and starve later steps.
+
+    `strength` (0..1) blends the correction.  When the field is filled edge to
+    edge with the Milky Way / a broad glow, a low-order model cannot tell that
+    glow from the sky background, so a full-strength correction carves the centre
+    and leaves a bright rim (ring) at the border; dialing strength down trades
+    some gradient removal for a clean, ring-free background."""
     h, w = rgb.shape[:2]
     nx = max(2, int(bins))
     ny = max(2, int(round(bins * h / w)))
@@ -301,14 +307,15 @@ def auto_flat(rgb, bins=16, degree=3, pct=25.0, mode="subtract"):
         for (i, j), cc in zip(terms, coef):
             model += cc * ((gy ** j)[:, None] * (gx ** i)[None, :])
         if mode == "divide":
-            out[..., c] = np.clip(rgb[..., c] / np.maximum(model, 1e-6), 0, 1)
+            corrected = np.clip(rgb[..., c] / np.maximum(model, 1e-6), 0, 1)
         else:
             # Subtract only the gradient *shape*: keep a pedestal at the model's
             # 10th percentile (the dark-sky level) so flat regions are not
             # floored to zero -- otherwise the whole background clips and later
             # steps break.
             ped = max(0.0, float(np.percentile(model, 10.0)))
-            out[..., c] = np.clip(rgb[..., c] - np.clip(model - ped, 0, None), 0, 1)
+            corrected = np.clip(rgb[..., c] - np.clip(model - ped, 0, None), 0, 1)
+        out[..., c] = np.clip(rgb[..., c] + strength * (corrected - rgb[..., c]), 0, 1)
         info.append((float(model.min()), float(model.max()), float(model.mean())))
     return out, info
 
@@ -402,6 +409,11 @@ def main():
     ap.add_argument("--flat-pct", type=float, default=25.0,
                     help="per-tile background percentile (default 25; low keeps "
                          "the estimate robust to stars)")
+    ap.add_argument("--flat-strength", type=float, default=1.0, metavar="S",
+                    help="blend the flat correction, 0..1 (default 1.0). Lower it "
+                         "if a full correction carves the middle of a "
+                         "Milky-Way-filled field and leaves a bright border ring; "
+                         "~0.3-0.5 removes the ring while keeping the gradient")
     ap.add_argument("--save-stages", action="store_true",
                     help="write every pipeline stage as its own image: stacked, "
                          "optional flat, stretched, optional neutralized / "
@@ -569,8 +581,10 @@ def main():
     if args.flat:
         linear, finfo = auto_flat(linear, bins=args.flat_bins,
                                   degree=args.flat_degree, pct=args.flat_pct,
-                                  mode=args.flat_mode)
-        log("  auto-flat (ABE, %s): model level " % args.flat_mode
+                                  mode=args.flat_mode,
+                                  strength=args.flat_strength)
+        log("  auto-flat (ABE, %s, strength=%.2f): model level " %
+            (args.flat_mode, args.flat_strength)
             + ", ".join("ch%d=%.4f..%.4f" % (c, mn, mx)
                         for c, (mn, mx, _) in enumerate(finfo)))
         add_stage("flat", linear)
