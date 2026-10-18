@@ -30,7 +30,7 @@ Method
                  (PixInsight BackgroundNeutralization), via --neutralize
     star_reduced erode the stars under a high-pass star mask so they shrink
                  without touching the background / Milky Way, via
-                 --star-reduce PX
+                 --star-reduce PX (default 1; 0 disables)
 
 Outputs (in --out) -- every stage is written, plus a comparison montage:
     transforms.json                       per-frame similarity transforms
@@ -454,10 +454,10 @@ def main():
     ap.add_argument("--neutralize", action="store_true",
                     help="neutralize the sky background to a grey before "
                          "stretching (PixInsight BackgroundNeutralization style)")
-    ap.add_argument("--star-reduce", type=float, default=0.0, metavar="PX",
+    ap.add_argument("--star-reduce", type=float, default=1.0, metavar="PX",
                     help="shrink stars by PX pixels with a morphology + star-mask "
                          "step applied to the stretched image (PixInsight "
-                         "StarReduction style); 0 disables (default)")
+                         "StarReduction style); default 1 (gentle), 0 disables")
     ap.add_argument("--flat", action="store_true",
                     help="remove the smooth background gradient on the LINEAR "
                          "image before stretching (PixInsight "
