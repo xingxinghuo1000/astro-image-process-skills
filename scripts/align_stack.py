@@ -17,18 +17,23 @@ Method
 4. Write an adaptive brightness-stretched copy (auto MTF) so faint structure
    such as the Milky Way is visible.
 
-4b. Optional post-processing, PixInsight style:
-    --neutralize    background neutralization (equalize the per-channel sky
-                    background so it becomes a neutral grey), applied linearly.
-    --star-reduce   star reduction: erode the stars under a high-pass star mask
-                    so they shrink without touching the background / Milky Way.
+4b. Optional post-processing, PixInsight style, applied in stages:
+    stage1  linear stacked image
+    stage2  adaptive stretch (auto MTF)
+    stage3  background neutralization -- equalize the per-channel sky background
+            to a neutral grey (PixInsight BackgroundNeutralization), via
+            --neutralize
+    stage4  star reduction -- erode the stars under a high-pass star mask so they
+            shrink without touching the background / Milky Way, via
+            --star-reduce PX
 
 Outputs (in --out):
     transforms.json                       per-frame similarity transforms
-    stack_<method>.tif                    linear 16-bit stacked image
-    stack_<method>_stretched.tif          adaptive-stretched 16-bit image
+    stack_<method>.tif                    linear 16-bit stacked image (stage1)
+    stack_<method>_stretched.tif          finished 16-bit image (last stage)
     stack_preview.jpg / stretched_preview.jpg
     star_mask.png                         star mask (with --star-reduce)
+    stage<i>_<name>.tif / _preview.jpg    every stage (with --save-stages)
     aligned/IMG_xxxx.tif                  sky-aligned frames (with --save-frames)
 
 Usage (Windows, using the repo's virtualenv):
@@ -283,6 +288,18 @@ def reduce_stars(rgb, amount=2.0, sigma=12.0):
     return out, mask
 
 
+def write_stage(out_dir, name, rgb, preview_scale=0.5, quality=92):
+    """Write one pipeline stage as a 16-bit TIFF plus a half-size JPEG preview."""
+    tif = os.path.join(out_dir, name + ".tif")
+    write_tiff16(tif, np.clip(rgb * 65535.0, 0, 65535).astype(np.uint16))
+    prev = cv2.resize((np.clip(rgb, 0, 1) * 255).astype(np.uint8), None,
+                      fx=preview_scale, fy=preview_scale, interpolation=cv2.INTER_AREA)
+    jpg = os.path.join(out_dir, name + "_preview.jpg")
+    cv2.imwrite(jpg, cv2.cvtColor(prev, cv2.COLOR_RGB2BGR),
+                [cv2.IMWRITE_JPEG_QUALITY, quality])
+    log(f"    {name}.tif  ({prev.shape[1]}x{prev.shape[0]} preview)")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--dir", default=r"D:\pic\DCIM-2026\08-shangduhu-2")
@@ -305,6 +322,10 @@ def main():
                     help="shrink stars by PX pixels with a morphology + star-mask "
                          "step applied to the stretched image (PixInsight "
                          "StarReduction style); 0 disables (default)")
+    ap.add_argument("--save-stages", action="store_true",
+                    help="write every pipeline stage as its own image: "
+                         "stage1_stacked, stage2_stretched[, stage3_neutralized]"
+                         "[, stage4_star_reduced] (16-bit TIFF + JPEG preview)")
     args = ap.parse_args()
 
     os.makedirs(args.out, exist_ok=True)
@@ -450,31 +471,23 @@ def main():
             block = median_store[:, r0:r1, :, :].astype(np.float32) / 65535.0
             stack[r0:r1] = np.median(block, axis=0)
 
-    if args.neutralize:
-        stack, bg_ref, gains = background_neutralize(stack)
-        log(f"  background neutralized: ref={np.round(bg_ref, 5).tolist()} "
-            f"gains={np.round(gains, 4).tolist()}")
+    # ---- staged post-processing -------------------------------------------------
+    # stage 1: the linear stacked image
+    stages = [("stage1_stacked", stack)]
 
-    stack16 = np.clip(stack * 65535.0, 0, 65535).astype(np.uint16)
-    stack_path = os.path.join(args.out, f"stack_{args.method}.tif")
-    write_tiff16(stack_path, stack16)
-    log(f"  wrote {stack_path}")
-
-    prev = stretch_preview(stack)
-    prev = cv2.resize(prev, None, fx=0.5, fy=0.5, interpolation=cv2.INTER_AREA)
-    cv2.imwrite(os.path.join(args.out, "stack_preview.jpg"),
-                cv2.cvtColor(prev, cv2.COLOR_RGB2BGR), [cv2.IMWRITE_JPEG_QUALITY, 92])
-
-    # adaptive brightness stretch -> extra file, so the Milky Way is visible
+    # stage 2: adaptive brightness stretch (auto MTF), so faint structure shows
     ys, mtf_m, bg = auto_stretch(stack, target_bg=args.stretch_bg)
+    stages.append(("stage2_stretched", ys))
 
+    # stage 3: background neutralization -- scale each channel so the sky
+    # background becomes a neutral grey (PixInsight BackgroundNeutralization).
     if args.neutralize:
-        # The per-channel black-point removal inside auto_stretch can re-tint the
-        # background, so re-neutralize in the stretched domain to guarantee a
-        # neutral grey background in the finished image.
         ys, sref, sgain = background_neutralize(ys)
-        log(f"  re-neutralized after stretch: ref={np.round(sref, 4).tolist()}")
+        log(f"  neutralized background: ref={np.round(sref, 4).tolist()} "
+            f"gains={np.round(sgain, 4).tolist()}")
+        stages.append(("stage3_neutralized", ys))
 
+    # stage 4: star reduction -- shrink stars under a high-pass star mask.
     if args.star_reduce > 0:
         ys, star_mask = reduce_stars(ys, amount=args.star_reduce)
         m8 = (np.clip(star_mask, 0, 1) * 255).astype(np.uint8)
@@ -482,6 +495,22 @@ def main():
                     cv2.cvtColor(m8, cv2.COLOR_GRAY2BGR))
         log(f"  stars reduced by {args.star_reduce:g}px "
             f"(mask {100.0 * (star_mask > 0.05).mean():.2f}% of frame)")
+        stages.append(("stage4_star_reduced", ys))
+
+    if args.save_stages:
+        log("  writing per-stage images ...")
+        for name, img in stages:
+            write_stage(args.out, name, img)
+
+    # ---- main deliverables (linear master + finished stretched image) ----
+    stack_path = os.path.join(args.out, f"stack_{args.method}.tif")
+    write_tiff16(stack_path, np.clip(stack * 65535.0, 0, 65535).astype(np.uint16))
+    log(f"  wrote {stack_path}")
+
+    prev = stretch_preview(stack)
+    prev = cv2.resize(prev, None, fx=0.5, fy=0.5, interpolation=cv2.INTER_AREA)
+    cv2.imwrite(os.path.join(args.out, "stack_preview.jpg"),
+                cv2.cvtColor(prev, cv2.COLOR_RGB2BGR), [cv2.IMWRITE_JPEG_QUALITY, 92])
 
     st_path = os.path.join(args.out, f"stack_{args.method}_stretched.tif")
     write_tiff16(st_path, (ys * 65535.0).astype(np.uint16))
