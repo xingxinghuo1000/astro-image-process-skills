@@ -1,0 +1,10 @@
+.venv/
+__pycache__/
+*.pyc
+out/
+_dbg/
+_test/
+_smoke/
+*.tif
+*.tiff
+*.dat
