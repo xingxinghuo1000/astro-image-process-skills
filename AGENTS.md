@@ -4,14 +4,12 @@ Guidance for AI coding agents working in this repository.
 
 ## Development policy
 
-- **Prefer Python.** The Python script (`scripts/align_stack.py`) is the primary,
-  actively developed implementation. Add features and fix bugs there first.
-- The C++ port under `cpp/` is a **reference/backup only** — kept for parity and
-  occasional no-Python deployments, not actively maintained. Do not mirror new
-  Python features into C++ unless explicitly asked.
-- See `docs/python-vs-cpp-report.md` for the benchmark/decision rationale
-  (functionally equivalent; performance a wash; Python far cheaper to build,
-  maintain and extend).
+- **Python only.** `scripts/align_stack.py` is the single implementation; add
+  features and fix bugs there.
+- A C++ port briefly existed and was removed (see `docs/python-vs-cpp-report.md`
+  for the benchmark/decision rationale: functionally equivalent, performance a
+  wash, Python far cheaper to build, maintain and extend). Do not reintroduce one
+  unless explicitly asked.
 
 ## Environment
 
@@ -47,25 +45,6 @@ Guidance for AI coding agents working in this repository.
 - Prefer the repo venv interpreter for every command.
 - Input CR2 frames live outside the repo (e.g. `D:\pic\...`); do not copy them in.
 - Outputs go to `--out` (default `out/`), which is git-ignored.
-
-## C++ port (reference/backup — see "Development policy")
-
-- `cpp/` re-implements `scripts/align_stack.py` (same algorithm, same CLI) with
-  no OpenCV dependency; the only external dep is the vendored LibRaw under
-  `cpp/third_party/` (LibRaw + its CMake wrapper).
-- Build (Windows, MSVC + Ninja from `.venv`):
-  ```bat
-  cpp\build.bat            :: Release (default)
-  cpp\build.bat Debug
-  ```
-  Produces `output/astro_align.exe`. It is a portable CMake project, so on
-  other platforms: `cmake -S cpp -B cpp/build -DCMAKE_BUILD_TYPE=Release` then
-  `cmake --build cpp/build -j`.
-- Run (arguments mirror the Python script):
-  ```bat
-  output\astro_align.exe --dir "D:\pic\DCIM-2026\08-shangduhu-2" --start 5994 --end 6012 --out out_cpp --ref 6003 --method median
-  ```
-- `output/`, `cpp/build/` are build artifacts (git-ignored); never commit them.
 
 ## Conventions
 
