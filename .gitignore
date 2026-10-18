@@ -1,6 +1,7 @@
 .venv/
 __pycache__/
 *.pyc
+# pipeline outputs: processed frames, intermediate stages, final images
 out/
 out_*/
 _dbg/

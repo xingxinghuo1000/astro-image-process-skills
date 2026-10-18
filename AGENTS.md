@@ -32,8 +32,10 @@ Guidance for AI coding agents working in this repository.
 - `scripts/` — all source scripts (e.g. `scripts/align_stack.py`).
   Put new code here; keep the repo root for docs/config only.
 - `requirements.txt` — pinned-free dependency list (`numpy`, `opencv-python`, `rawpy`).
-- `out/`, `*.tif`, `.venv/` — **not** versioned (see `.gitignore`); never commit
-  generated stacks or large binaries.
+- `out/` — **the default output directory** for everything the pipeline produces
+  (processed frames, every intermediate stage, and the final images). It is
+  **not** versioned (see `.gitignore`); never commit generated stacks or large
+  binaries.
 
 ## Running
 
@@ -44,7 +46,8 @@ Guidance for AI coding agents working in this repository.
 
 - Prefer the repo venv interpreter for every command.
 - Input CR2 frames live outside the repo (e.g. `D:\pic\...`); do not copy them in.
-- Outputs go to `--out` (default `out/`), which is git-ignored.
+- **Processed images, intermediate products, and final products all default to the
+  `out/` directory** (`--out`, default `out/`). `out/` is git-ignored.
 
 ## Conventions
 
