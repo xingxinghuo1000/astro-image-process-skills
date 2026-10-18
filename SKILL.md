@@ -59,6 +59,8 @@ python -m venv .venv
 - `--stretch-bg 0.20` — 拉伸后背景目标亮度，越大越亮。
 - `--save-frames` — 另存每帧对齐后的全分辨率 TIFF（较占空间）。
 - `--exclude 6007,6012` — 剔除个别帧。
+- `--neutralize` — **背景中性化**（类 PixInsight `BackgroundNeutralization`）：按通道测量天空背景并缩放到中性灰，先在线性主图上做、拉伸后再校正一次，消除偏色（如光害导致的紫/绿底）。
+- `--star-reduce PX` — **缩星**（类 PixInsight `StarReduction`）：高通星点掩膜下的形态学腐蚀，把星点半径缩小约 PX 像素（推荐 1~3），背景与银河不受影响，让星云/银河更突出。0 为关闭。
 
 ## 输出（在 `--out` 目录）
 
@@ -68,6 +70,7 @@ python -m venv .venv
 | `stack_<method>_stretched.tif` | 自适应拉伸后的 16-bit 成品 |
 | `stretched_preview.jpg` / `stack_preview.jpg` | 预览图 |
 | `transforms.json` | 每帧的相似变换、内点数、评分 |
+| `star_mask.png` | 星点掩膜（使用 `--star-reduce` 时输出，便于检查） |
 | `aligned/IMG_xxxx.tif` | 每帧对齐结果（需 `--save-frames`） |
 
 ## 注意

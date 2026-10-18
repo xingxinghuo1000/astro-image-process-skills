@@ -17,11 +17,18 @@ Method
 4. Write an adaptive brightness-stretched copy (auto MTF) so faint structure
    such as the Milky Way is visible.
 
+4b. Optional post-processing, PixInsight style:
+    --neutralize    background neutralization (equalize the per-channel sky
+                    background so it becomes a neutral grey), applied linearly.
+    --star-reduce   star reduction: erode the stars under a high-pass star mask
+                    so they shrink without touching the background / Milky Way.
+
 Outputs (in --out):
     transforms.json                       per-frame similarity transforms
     stack_<method>.tif                    linear 16-bit stacked image
     stack_<method>_stretched.tif          adaptive-stretched 16-bit image
     stack_preview.jpg / stretched_preview.jpg
+    star_mask.png                         star mask (with --star-reduce)
     aligned/IMG_xxxx.tif                  sky-aligned frames (with --save-frames)
 
 Usage (Windows, using the repo's virtualenv):
@@ -213,6 +220,69 @@ def auto_stretch(rgb_lin, target_bg=0.20, black_pct=0.3, white_pct=99.95):
     return np.clip(y, 0, 1), m, bg
 
 
+def background_reference(rgb, bg_pct=0.5):
+    """Per-channel robust sky-background level.
+
+    Only the darker `bg_pct` fraction of pixels (by luminance) is used, so the
+    estimate is not biased by stars or the bright Milky Way core.  Median (not
+    mean) keeps it robust to the few remaining bright pixels."""
+    lum = rgb.mean(axis=2)
+    thr = np.percentile(lum, bg_pct * 100.0)
+    m = lum <= thr
+    if m.sum() < 100:
+        m = np.ones_like(lum, dtype=bool)
+    return np.array([np.median(rgb[..., c][m]) for c in range(3)], np.float64)
+
+
+def background_neutralize(rgb, bg_pct=0.5):
+    """Make the sky background a neutral grey, PixInsight BackgroundNeutralization
+    style: measure the background reference per channel and scale each channel so
+    they all match the average reference (a pure grey).  Applied on linear data."""
+    ref = background_reference(rgb, bg_pct)
+    target = float(ref.mean())
+    gains = target / np.maximum(ref, 1e-6)
+    out = np.clip(rgb * gains[None, None, :], 0, 1)
+    return out, ref, gains
+
+
+def make_star_mask(lum, sigma=12.0, nsigma=5.0, grow=2.0):
+    """Soft mask covering stars (not the large-scale Milky Way / foreground).
+
+    A high-pass isolates small bright blobs (stars + their halos) from the
+    smooth background; a noise-robust `mean + nsigma*std` threshold (as used for
+    star detection) zeroes the background, and the ramp up to a high percentile
+    is grown/blurred so the morphology below also reshapes the halo."""
+    hp = np.clip(lum - cv2.GaussianBlur(lum, (0, 0), sigma), 0, None)
+    thr = float(hp.mean()) + nsigma * float(hp.std())
+    hi = float(np.percentile(hp, 99.9))
+    if hi <= thr:
+        hi = thr + 1e-6
+    mask = np.clip((hp - thr) / (hi - thr), 0, 1)
+    if grow > 0:
+        mask = cv2.GaussianBlur(mask, (0, 0), grow)
+    return np.clip(mask, 0, 1)
+
+
+def reduce_stars(rgb, amount=2.0, sigma=12.0):
+    """Shrink stars, PixInsight StarReduction style.
+
+    `amount` is the erosion radius in pixels: a grey erosion of the luminance
+    pulls every bright edge inward, and the darkening ratio is applied to the
+    RGB (so hue is preserved) only inside the star mask -- background and the
+    smooth Milky Way are left untouched."""
+    r = int(round(amount))
+    lum = rgb.mean(axis=2).astype(np.float32)
+    if r < 1:
+        return rgb, np.zeros(lum.shape, np.float32)
+    mask = make_star_mask(lum, sigma=sigma)
+    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * r + 1, 2 * r + 1))
+    lum_e = cv2.erode(lum, k)
+    scale = np.where(lum > 1e-6, lum_e / np.maximum(lum, 1e-6), 1.0).astype(np.float32)
+    scale = 1.0 + mask * (scale - 1.0)
+    out = np.clip(rgb * scale[..., None], 0, 1)
+    return out, mask
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--dir", default=r"D:\pic\DCIM-2026\08-shangduhu-2")
@@ -228,6 +298,13 @@ def main():
     ap.add_argument("--stretch-bg", type=float, default=0.20,
                     help="target sky background level of the stretched output "
                          "(higher = brighter; default 0.20)")
+    ap.add_argument("--neutralize", action="store_true",
+                    help="neutralize the sky background to a grey before "
+                         "stretching (PixInsight BackgroundNeutralization style)")
+    ap.add_argument("--star-reduce", type=float, default=0.0, metavar="PX",
+                    help="shrink stars by PX pixels with a morphology + star-mask "
+                         "step applied to the stretched image (PixInsight "
+                         "StarReduction style); 0 disables (default)")
     args = ap.parse_args()
 
     os.makedirs(args.out, exist_ok=True)
@@ -373,6 +450,11 @@ def main():
             block = median_store[:, r0:r1, :, :].astype(np.float32) / 65535.0
             stack[r0:r1] = np.median(block, axis=0)
 
+    if args.neutralize:
+        stack, bg_ref, gains = background_neutralize(stack)
+        log(f"  background neutralized: ref={np.round(bg_ref, 5).tolist()} "
+            f"gains={np.round(gains, 4).tolist()}")
+
     stack16 = np.clip(stack * 65535.0, 0, 65535).astype(np.uint16)
     stack_path = os.path.join(args.out, f"stack_{args.method}.tif")
     write_tiff16(stack_path, stack16)
@@ -385,6 +467,22 @@ def main():
 
     # adaptive brightness stretch -> extra file, so the Milky Way is visible
     ys, mtf_m, bg = auto_stretch(stack, target_bg=args.stretch_bg)
+
+    if args.neutralize:
+        # The per-channel black-point removal inside auto_stretch can re-tint the
+        # background, so re-neutralize in the stretched domain to guarantee a
+        # neutral grey background in the finished image.
+        ys, sref, sgain = background_neutralize(ys)
+        log(f"  re-neutralized after stretch: ref={np.round(sref, 4).tolist()}")
+
+    if args.star_reduce > 0:
+        ys, star_mask = reduce_stars(ys, amount=args.star_reduce)
+        m8 = (np.clip(star_mask, 0, 1) * 255).astype(np.uint8)
+        cv2.imwrite(os.path.join(args.out, "star_mask.png"),
+                    cv2.cvtColor(m8, cv2.COLOR_GRAY2BGR))
+        log(f"  stars reduced by {args.star_reduce:g}px "
+            f"(mask {100.0 * (star_mask > 0.05).mean():.2f}% of frame)")
+
     st_path = os.path.join(args.out, f"stack_{args.method}_stretched.tif")
     write_tiff16(st_path, (ys * 65535.0).astype(np.uint16))
     ys_prev = cv2.resize((ys * 255).astype(np.uint8), None, fx=0.5, fy=0.5,
