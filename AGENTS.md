@@ -2,6 +2,17 @@
 
 Guidance for AI coding agents working in this repository.
 
+## Development policy
+
+- **Prefer Python.** The Python script (`scripts/align_stack.py`) is the primary,
+  actively developed implementation. Add features and fix bugs there first.
+- The C++ port under `cpp/` is a **reference/backup only** — kept for parity and
+  occasional no-Python deployments, not actively maintained. Do not mirror new
+  Python features into C++ unless explicitly asked.
+- See `docs/python-vs-cpp-report.md` for the benchmark/decision rationale
+  (functionally equivalent; performance a wash; Python far cheaper to build,
+  maintain and extend).
+
 ## Environment
 
 - **Always use the virtual environment at the repository root: `.venv/`.**
@@ -37,7 +48,7 @@ Guidance for AI coding agents working in this repository.
 - Input CR2 frames live outside the repo (e.g. `D:\pic\...`); do not copy them in.
 - Outputs go to `--out` (default `out/`), which is git-ignored.
 
-## C++ port
+## C++ port (reference/backup — see "Development policy")
 
 - `cpp/` re-implements `scripts/align_stack.py` (same algorithm, same CLI) with
   no OpenCV dependency; the only external dep is the vendored LibRaw under

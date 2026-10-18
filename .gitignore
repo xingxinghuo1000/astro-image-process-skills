@@ -2,7 +2,7 @@
 __pycache__/
 *.pyc
 out/
-out_cpp*/
+out_*/
 _dbg/
 _test/
 _smoke*/
