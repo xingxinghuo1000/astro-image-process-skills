@@ -32,16 +32,18 @@ Method
                  without touching the background / Milky Way, via
                  --star-reduce PX
 
-Outputs (in --out):
+Outputs (in --out) -- every stage is written, plus a comparison montage:
     transforms.json                       per-frame similarity transforms
-    stack_<method>.tif                    linear 16-bit stacked image (stage1)
-    stack_<method>_stretched.tif          finished 16-bit image (last stage)
-    stack_preview.jpg / stretched_preview.jpg
+    stage<i>_<name>.tif                   every stage, 16-bit linear TIFF
+    stage<i>_<name>_preview.jpg           half-size preview of every stage
+    stages_montage.jpg                    all stages side by side, labelled
     star_mask.png                         star mask (with --star-reduce)
     flat_compare.jpg                      no-flat vs auto-flat, + strength sweep
-                                          (always, with --flat; for the user to
-                                          judge the flat and pick a strength)
-    stage<i>_<name>.tif / _preview.jpg    every stage (with --save-stages)
+                                          (with --flat; for the user to judge the
+                                          flat and pick a strength)
+    stack_<method>.tif                    linear 16-bit master (stage1)
+    stack_<method>_stretched.tif/.jpg     finished image, full-res TIFF + JPEG
+    stack_preview.jpg / stretched_preview.jpg
     aligned/IMG_xxxx.tif                  sky-aligned frames (with --save-frames)
 
 Usage (Windows, using the repo's virtualenv):
@@ -409,6 +411,28 @@ def write_stage(out_dir, name, rgb, preview_scale=0.5, quality=92):
     log(f"    {name}.tif  ({prev.shape[1]}x{prev.shape[0]} preview)")
 
 
+def write_montage(out_dir, stages, target_bg=0.20, cols=3, scale=0.22,
+                  quality=90):
+    """Tile every stage into one labelled figure so the whole progression can be
+    compared at a glance.  Linear stages (stacked / flat) are shown stretched so
+    they are visible next to the already-stretched stages."""
+    panels = []
+    for name, img in stages:
+        disp = (auto_stretch(img, target_bg=target_bg)[0]
+                if ("stacked" in name or "flat" in name) else img)
+        p = cv2.resize((np.clip(disp, 0, 1) * 255).astype(np.uint8), None,
+                       fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
+        panels.append(_label(p, name))
+    while len(panels) % cols:
+        panels.append(np.zeros_like(panels[0]))
+    rows = [np.hstack(panels[i:i + cols]) for i in range(0, len(panels), cols)]
+    grid = np.vstack(rows)
+    path = os.path.join(out_dir, "stages_montage.jpg")
+    cv2.imwrite(path, cv2.cvtColor(grid, cv2.COLOR_RGB2BGR),
+                [cv2.IMWRITE_JPEG_QUALITY, quality])
+    return path
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--dir", default=r"D:\pic\DCIM-2026\08-shangduhu-2")
@@ -457,10 +481,6 @@ def main():
                     help="also render these flat strengths (0..1) into "
                          "flat_compare.jpg so you can pick --flat-strength from a "
                          "single run, e.g. 0.4,0.5,0.6,0.7")
-    ap.add_argument("--save-stages", action="store_true",
-                    help="write every pipeline stage as its own image: stacked, "
-                         "optional flat, stretched, optional neutralized / "
-                         "star_reduced (16-bit TIFF + JPEG preview)")
     args = ap.parse_args()
 
     os.makedirs(args.out, exist_ok=True)
@@ -661,12 +681,14 @@ def main():
             f"(mask {100.0 * (star_mask > 0.05).mean():.2f}% of frame)")
         add_stage("star_reduced", ys)
 
-    if args.save_stages:
-        log("  writing per-stage images ...")
-        for name, img in stages:
-            write_stage(args.out, name, img)
+    # ---- every stage as its own TIFF + preview, plus a comparison montage ----
+    log("  writing per-stage images ...")
+    for name, img in stages:
+        write_stage(args.out, name, img)
+    montage = write_montage(args.out, stages, target_bg=args.stretch_bg)
+    log(f"  wrote {montage}  (all stages side by side)")
 
-    # ---- main deliverables (linear master + finished stretched image) ----
+    # ---- final deliverables (linear master + finished image, TIFF and JPEG) ----
     stack_path = os.path.join(args.out, f"stack_{args.method}.tif")
     write_tiff16(stack_path, np.clip(linear * 65535.0, 0, 65535).astype(np.uint16))
     log(f"  wrote {stack_path}")
@@ -678,13 +700,18 @@ def main():
 
     st_path = os.path.join(args.out, f"stack_{args.method}_stretched.tif")
     write_tiff16(st_path, (ys * 65535.0).astype(np.uint16))
+    st_jpg = os.path.join(args.out, f"stack_{args.method}_stretched.jpg")
+    cv2.imwrite(st_jpg,
+                cv2.cvtColor((np.clip(ys, 0, 1) * 255 + 0.5).astype(np.uint8),
+                             cv2.COLOR_RGB2BGR),
+                [cv2.IMWRITE_JPEG_QUALITY, 95])
     ys_prev = cv2.resize((ys * 255).astype(np.uint8), None, fx=0.5, fy=0.5,
                          interpolation=cv2.INTER_AREA)
     cv2.imwrite(os.path.join(args.out, "stretched_preview.jpg"),
                 cv2.cvtColor(ys_prev, cv2.COLOR_RGB2BGR),
                 [cv2.IMWRITE_JPEG_QUALITY, 92])
-    log(f"  wrote {st_path}  (auto-stretch: mtf_m={mtf_m:.4f}, bg={bg:.4f}, "
-        f"target={args.stretch_bg})")
+    log(f"  wrote {st_path} + stack_{args.method}_stretched.jpg (full-res)"
+        f"  (auto-stretch: mtf_m={mtf_m:.4f}, bg={bg:.4f}, target={args.stretch_bg})")
 
     with open(os.path.join(args.out, "transforms.json"), "w") as f:
         json.dump(dict(reference=ref_id, reg_scale=reg_scale, frames=records), f, indent=2)

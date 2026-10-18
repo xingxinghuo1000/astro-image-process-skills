@@ -64,22 +64,27 @@ python -m venv .venv
   - **平场是否采用由用户决定**：只要用了 `--flat`，就一定会输出对比图 `flat_compare.jpg`（左：不平场，"成品"观感；右：平场后），供用户判断要不要保留。想一次比较多个强度，用 `--flat-sweep 0.4,0.5,0.6,0.7`，对比图里会平铺"不平场 + 各强度"，选好后再用 `--flat-strength` 定值正式出图。
   - ⚠️ **外圈亮环**：若画面被银河/大范围辉光铺满，低阶背景模型分不清"天空背景"和"目标本身的辉光"，满强度扣除会把中心压暗、边缘相对变亮，出现一圈亮环。此时把 `--flat-strength` 调到 ~0.3~0.6（默认 1.0）即可在保留梯度去除的同时消除亮环。
 - `--star-reduce PX` — **缩星**（类 PixInsight `StarReduction`）：高通星点掩膜下的形态学腐蚀，把星点半径缩小约 PX 像素（推荐 1~3），背景与银河不受影响，让星云/银河更突出。0 为关闭。
-- `--save-stages` — **分阶段输出**：把每个处理阶段各存一张图（16-bit TIFF + 半尺寸 JPEG 预览），都在 `--out` 目录里。
 
 ## 输出（在 `--out` 目录）
 
+> **每个阶段都会输出中间结果**：`stageN_<name>.tif`（16-bit TIFF）+ 同名 `_preview.jpg`（半尺寸预览），编号按实际启用的步骤递增；并把**所有阶段拼接成一张对比图** `stages_montage.jpg`（线性阶段会自动拉伸后展示，便于和后续阶段比较）。
+
 | 文件 | 说明 |
 | --- | --- |
-| `stack_<method>.tif` | 对齐叠加后的**线性** 16-bit 原图（供后期） |
-| `stack_<method>_stretched.tif` | 自适应拉伸后的 16-bit 成品 |
-| `stretched_preview.jpg` / `stack_preview.jpg` | 预览图 |
+| `stageN_<name>.tif` + `_preview.jpg` | **每个处理阶段的中间结果**（TIFF + 预览）。如 `stage1_stacked` / `stage2_flat` / `stage3_stretched` / `stage4_neutralized` / `stage5_star_reduced` |
+| `stages_montage.jpg` | **各阶段成果多图拼接对比图**（全部阶段并排，带标签） |
+| `stack_<method>.tif` | 对齐叠加后的**线性** 16-bit 主图（供后期） |
+| `stack_<method>_stretched.tif` | 最终成品：16-bit TIFF（完整分辨率） |
+| `stack_<method>_stretched.jpg` | 最终成品：JPEG（完整分辨率） |
+| `stretched_preview.jpg` / `stack_preview.jpg` | 半尺寸预览图 |
 | `transforms.json` | 每帧的相似变换、内点数、评分 |
 | `star_mask.png` | 星点掩膜（使用 `--star-reduce` 时输出，便于检查） |
 | `flat_compare.jpg` | 平场对比图（使用 `--flat` 时输出）：不平场 vs 平场（可含 `--flat-sweep` 强度扫描），**交给用户目视决定是否采用/选用哪个强度** |
-| `stageN_*.tif`（如 `stage1_stacked` / `stage2_flat` / `stage3_stretched` / `stage4_neutralized` / `stage5_star_reduced`） | 各处理阶段（需 `--save-stages`，同名 `_preview.jpg` 为预览；编号按实际启用的步骤递增） |
 | `aligned/IMG_xxxx.tif` | 每帧对齐结果（需 `--save-frames`） |
 
 处理阶段顺序：**叠加 → 自动平场 → 拉伸 → 中性化 → 缩星**（平场/中性化/缩星均可关闭）。
+
+**最终出图**：成品同时输出**完整分辨率的 TIFF 和 JPEG**（`stack_<method>_stretched.tif` / `.jpg`），可直接交付。
 
 ## 平场工作流（对比 → 用户决策）
 
