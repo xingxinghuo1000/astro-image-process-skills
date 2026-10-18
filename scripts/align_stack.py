@@ -38,6 +38,9 @@ Outputs (in --out):
     stack_<method>_stretched.tif          finished 16-bit image (last stage)
     stack_preview.jpg / stretched_preview.jpg
     star_mask.png                         star mask (with --star-reduce)
+    flat_compare.jpg                      no-flat vs auto-flat, + strength sweep
+                                          (always, with --flat; for the user to
+                                          judge the flat and pick a strength)
     stage<i>_<name>.tif / _preview.jpg    every stage (with --save-stages)
     aligned/IMG_xxxx.tif                  sky-aligned frames (with --save-frames)
 
@@ -320,6 +323,42 @@ def auto_flat(rgb, bins=16, degree=3, pct=25.0, mode="subtract", strength=1.0):
     return out, info
 
 
+def _label(img, text):
+    cv2.putText(img, text, (15, 45), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 255, 0), 3)
+    return img
+
+
+def _product_preview(lin, target_bg, neutralize, scale=0.5):
+    """Stretched (and optionally neutralized) preview of a linear image."""
+    ys, _, _ = auto_stretch(lin, target_bg=target_bg)
+    if neutralize:
+        ys, _, _ = background_neutralize(ys)
+    p = (np.clip(ys, 0, 1) * 255).astype(np.uint8)
+    return cv2.resize(p, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
+
+
+def write_flat_compare(stack_lin, flat_lin, target_bg, neutralize, out_dir,
+                       sweep=(), scale=0.5):
+    """Side-by-side stretched previews -- no-flat vs auto-flat, plus an optional
+    strength sweep -- so the user can judge whether the flat helps and pick a
+    `--flat-strength`.  The flat is a judgement call (it removes the light-
+    pollution gradient but can carve the glow of a frame-filling Milky Way), so
+    the pipeline always writes this figure whenever --flat is used."""
+    def blend(s):
+        return np.clip(stack_lin + s * (flat_lin - stack_lin), 0, 1)
+    panels = [("no flat", _product_preview(stack_lin, target_bg, neutralize, scale))]
+    for s in sweep:
+        panels.append(("flat s=%.2f" % s,
+                       _product_preview(blend(s), target_bg, neutralize, scale)))
+    if not sweep:
+        panels.append(("auto flat", _product_preview(flat_lin, target_bg, neutralize, scale)))
+    row = np.hstack([_label(im, t) for t, im in panels])
+    path = os.path.join(out_dir, "flat_compare.jpg")
+    cv2.imwrite(path, cv2.cvtColor(row, cv2.COLOR_RGB2BGR),
+                [cv2.IMWRITE_JPEG_QUALITY, 90])
+    return path
+
+
 def make_star_mask(lum, sigma=12.0, nsigma=5.0, grow=2.0):
     """Soft mask covering stars (not the large-scale Milky Way / foreground).
 
@@ -414,6 +453,10 @@ def main():
                          "if a full correction carves the middle of a "
                          "Milky-Way-filled field and leaves a bright border ring; "
                          "~0.3-0.5 removes the ring while keeping the gradient")
+    ap.add_argument("--flat-sweep", default="", metavar="S1,S2,...",
+                    help="also render these flat strengths (0..1) into "
+                         "flat_compare.jpg so you can pick --flat-strength from a "
+                         "single run, e.g. 0.4,0.5,0.6,0.7")
     ap.add_argument("--save-stages", action="store_true",
                     help="write every pipeline stage as its own image: stacked, "
                          "optional flat, stretched, optional neutralized / "
@@ -577,17 +620,24 @@ def main():
 
     # stage: auto flat (ABE) -- fit and subtract the smooth per-channel
     # background gradient on the LINEAR image, where gradients are additive,
-    # i.e. before the nonlinear stretch.
+    # i.e. before the nonlinear stretch.  `flat_full` is the full-strength
+    # correction; the applied result is a strength blend of it, and a
+    # no-flat/flat comparison is always written so the user can judge it.
     if args.flat:
-        linear, finfo = auto_flat(linear, bins=args.flat_bins,
-                                  degree=args.flat_degree, pct=args.flat_pct,
-                                  mode=args.flat_mode,
-                                  strength=args.flat_strength)
+        flat_full, finfo = auto_flat(linear, bins=args.flat_bins,
+                                     degree=args.flat_degree, pct=args.flat_pct,
+                                     mode=args.flat_mode)
+        linear = np.clip(linear + args.flat_strength * (flat_full - linear), 0, 1)
         log("  auto-flat (ABE, %s, strength=%.2f): model level " %
             (args.flat_mode, args.flat_strength)
             + ", ".join("ch%d=%.4f..%.4f" % (c, mn, mx)
                         for c, (mn, mx, _) in enumerate(finfo)))
         add_stage("flat", linear)
+        sweep = [float(x) for x in args.flat_sweep.split(",") if x.strip()]
+        cmp_path = write_flat_compare(stack, flat_full, args.stretch_bg,
+                                     args.neutralize, args.out, sweep)
+        log(f"  wrote {cmp_path}  (no flat vs auto flat"
+            + ("" if not sweep else " vs strength sweep " + args.flat_sweep) + ")")
 
     # stage: adaptive brightness stretch (auto MTF), so faint structure shows
     ys, mtf_m, bg = auto_stretch(linear, target_bg=args.stretch_bg)
