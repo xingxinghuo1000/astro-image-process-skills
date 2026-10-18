@@ -4,8 +4,9 @@ Guidance for AI coding agents working in this repository.
 
 ## Development policy
 
-- **Python only.** `scripts/align_stack.py` is the single implementation; add
-  features and fix bugs there.
+- **Python only.** `scripts/align_stack.py` is a thin command-line front end; the
+  implementation lives in the `scripts/astro/` package (one module per pipeline
+  step). Add features and fix bugs in the relevant module.
 - A C++ port briefly existed and was removed (see `docs/python-vs-cpp-report.md`
   for the benchmark/decision rationale: functionally equivalent, performance a
   wash, Python far cheaper to build, maintain and extend). Do not reintroduce one
@@ -29,8 +30,18 @@ Guidance for AI coding agents working in this repository.
 
 ## Layout
 
-- `scripts/` — all source scripts (e.g. `scripts/align_stack.py`).
-  Put new code here; keep the repo root for docs/config only.
+- `scripts/align_stack.py` — the CLI/argparse entry point (kept thin); it just
+  parses arguments and calls `astro.pipeline.run`.
+- `scripts/astro/` — the implementation, one module per pipeline step:
+  - `util.py` logging + array helpers; `imgio.py` CR2 decode / TIFF write
+  - `registration.py` ORB + star-centroid similarity registration
+  - `stacking.py` mean / block-wise median accumulation
+  - `flat.py` auto flat (ABE); `stretch.py` auto MTF; `neutralize.py` background
+    neutralization; `star_reduce.py` star shrink
+  - `composite.py` sky/ground ("天地") stitch; `horizon.py` sky-ground boundary
+    detection
+  - `render.py` per-stage TIFF/JPEG, montage, comparison figures
+  - `pipeline.py` the orchestration that sequences the steps
 - `requirements.txt` — pinned-free dependency list (`numpy`, `opencv-python`, `rawpy`).
 - `out/` — **the default output directory** for everything the pipeline produces
   (processed frames, every intermediate stage, and the final images). It is
