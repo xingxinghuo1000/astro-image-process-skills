@@ -6,24 +6,28 @@ fixed tripod (sky rotates while the foreground stays static).
 
 Method
 ------
-1. Decode each CR2 once to linear 16-bit RGB (rawpy, camera WB, no auto-bright).
-2. Build a high-pass grayscale image, run ORB feature matching against a
-   reference frame and fit a similarity transform (rotation + translation,
-   scale fixed ~1) with RANSAC.  RANSAC locks onto the *stars* (which move
-   coherently) and rejects the sensor-noise / static foreground (which do not).
-3. Warp the full-resolution linear RGB of every frame into the reference
-   frame's coordinate system and accumulate a weighted mean (sky-aligned stack).
+1. Decode grayscale previews of every frame and build a per-pixel static-pattern
+   map (high percentile): this isolates hot pixels / fixed-pattern noise, which
+   is subtracted so feature matching can only latch onto real, moving stars.
+2. High-pass the cleaned gray, run ORB feature matching against a reference
+   frame and fit a similarity transform (rotation + translation, scale ~1) with
+   RANSAC, then refine on star centroids to sub-pixel accuracy.
+3. Warp the full-resolution linear RGB of every frame into the reference frame
+   and accumulate a weighted mean or a median (median removes hot-pixel trails).
+4. Write an adaptive brightness-stretched copy (auto MTF) so faint structure
+   such as the Milky Way is visible.
 
 Outputs (in --out):
-    transforms.json / transforms.txt   per-frame similarity transforms
-    aligned/IMG_xxxx.tif               sky-aligned linear 16-bit frames (opt)
-    stack_mean.tif                     linear 16-bit stacked image
-    stack_preview.jpg                  arcsinh-stretched preview of the stack
+    transforms.json                       per-frame similarity transforms
+    stack_<method>.tif                    linear 16-bit stacked image
+    stack_<method>_stretched.tif          adaptive-stretched 16-bit image
+    stack_preview.jpg / stretched_preview.jpg
+    aligned/IMG_xxxx.tif                  sky-aligned frames (with --save-frames)
 
-Usage:
-    python align_stack.py --dir "D:\\pic\\DCIM-2026\\08-shangduhu-2" \
-                          --start 5994 --end 6012 \
-                          --out out --ref 6003
+Usage (Windows, using the repo's virtualenv):
+    .venv/Scripts/python.exe scripts/align_stack.py \
+        --dir "D:\\pic\\DCIM-2026\\08-shangduhu-2" \
+        --start 5994 --end 6012 --out out --ref 6003 --method median
 """
 import argparse, json, os, sys, time
 import numpy as np
