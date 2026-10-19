@@ -47,9 +47,14 @@ def _overlay(comp, half_mask, line, target_bg, path, quality=88):
 
 
 def run_composite(sky, ground, evidence, out_dir, target_bg=0.20, mode="mask",
-                  feather=25.0, thresh=0.05, min_sky=0.02, preview_scale=0.5):
+                  feather=25.0, thresh=0.05, min_sky=0.02, preview_scale=0.5,
+                  sky_mask=None):
     """Write the ground layer + inspection figures, detect the boundary from the
-    sky `evidence` map, composite, and return (composite or None, info dict)."""
+    sky `evidence` map, composite, and return (composite or None, info dict).
+
+    If `sky_mask` is given (a full-res float mask, 1 = sky) the detection step is
+    skipped and that mask is used instead -- this is how a boundary recognised by
+    a large image model (passed in via ``--ground-mask``) is applied."""
     write_tiff16(os.path.join(out_dir, "ground_stack.tif"),
                  np.clip(ground * 65535.0, 0, 65535).astype(np.uint16))
     prev = cv2.resize(to_u8(auto_stretch(ground, target_bg=target_bg)[0]), None,
@@ -59,14 +64,19 @@ def run_composite(sky, ground, evidence, out_dir, target_bg=0.20, mode="mask",
                 cv2.cvtColor(prev, cv2.COLOR_RGB2BGR),
                 [cv2.IMWRITE_JPEG_QUALITY, 92])
 
-    mask, info = horizon.detect(evidence, sky.shape[:2], mode=mode, t=thresh,
-                                feather=feather)
+    if sky_mask is not None:
+        mask = sky_mask
+        info = dict(failed=False, mode="external (model)", slope=None,
+                    intercept=None, inliers=0, coverage=float(mask.mean()))
+    else:
+        mask, info = horizon.detect(evidence, sky.shape[:2], mode=mode, t=thresh,
+                                    feather=feather)
     if mask is None:
         log(f"  !! composite: {info.get('reason', 'horizon detection failed')}"
             " -- skipping sky/ground stitch")
         return None, info
     cov = info["coverage"]
-    log(f"  sky/ground boundary ({mode}): coverage={100.0 * cov:.1f}%"
+    log(f"  sky/ground boundary ({info['mode']}): coverage={100.0 * cov:.1f}%"
         + ("" if info["slope"] is None else
            f", line slope={info['slope']:+.3f} intercept={info['intercept']:.1f}px"
            f" ({info['inliers']} pts)"))

@@ -248,10 +248,26 @@ def run(args):
         if os.environ.get("ASTRO_DEBUG_VAR"):
             np.savez(os.path.join(args.out, "_dbg_var.npz"),
                      var_sum=var_sum, var_sq=var_sq, var_n=var_n)
+        # A boundary recognised by a large image model can be supplied as a
+        # ground mask (white = ground); it overrides the variance detection.
+        sky_mask = None
+        if args.ground_mask:
+            gm = cv2.imread(args.ground_mask, cv2.IMREAD_GRAYSCALE)
+            if gm is None:
+                log(f"  !! composite: cannot read --ground-mask "
+                    f"{args.ground_mask}; falling back to auto detection")
+            else:
+                gm = cv2.resize(gm, (W, H), interpolation=cv2.INTER_LINEAR)
+                sky = 1.0 - gm.astype(np.float32) / 255.0
+                sky = cv2.GaussianBlur(sky, (0, 0),
+                                       max(1.0, args.composite_feather))
+                sky_mask = np.clip(sky, 0, 1).astype(np.float32)
+                log(f"  ground mask (model): {args.ground_mask}  "
+                    f"ground={100.0 * (gm > 127).mean():.1f}%")
         comp, info = composite_step.run_composite(
             master, ground, evidence, args.out, target_bg=args.stretch_bg,
             mode=args.composite_horizon, feather=args.composite_feather,
-            thresh=args.composite_thresh)
+            thresh=args.composite_thresh, sky_mask=sky_mask)
         if comp is not None:
             add_stage("composite", comp, linear=True)
             master = comp

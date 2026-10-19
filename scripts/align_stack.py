@@ -136,6 +136,10 @@ def build_parser():
                    help="sky-evidence threshold (fraction of the 99.5th percentile); "
                         "raise it to pull the boundary up, lower it to include "
                         "fainter sky (default 0.05)")
+    c.add_argument("--ground-mask", default="",
+                   help="path to a ground mask (grayscale PNG, white = ground) "
+                        "recognised by a large image model; overrides the "
+                        "variance-based boundary detection")
     c.add_argument("--ground-dir", default="",
                    help="use a separate foreground sequence for the ground layer "
                         "(default: the input frames, un-registered)")
