@@ -54,7 +54,12 @@ python -m venv .venv
 
 常用参数：
 
-- `--method mean|median` — 均值信噪比更高；**中值**可去除热噪点条纹、卫星轨迹（默认 mean，星野推荐 median）。
+- `--method median` — **强约束：星野叠加必须用中值（median），不要用 mean。** 相机在跟踪/赤道仪上时画幅会旋转，而热噪点固定在传感器像素上，对齐后它相对天空移动；mean 会把每个热噪点摊成 `热值/N` 的彩色**短条纹**，低于任何阈值、无法消除；median 直接把它当离群值剔除，从根上消掉这些红/绿/蓝短线。默认即 `median`，`mean` 仅用于特殊场景且会打印警告。
+- `--hot-pre` / `--hot-post` — **热噪点去除**（单帧、逐通道）：把拉伸后仍可见的**纯红/绿/蓝点**（CMOS 热噪点）检测并修复。
+  - 判据（逐通道，在"通道 − 局部中值"残差上）：过 MAD/绝对阈值、是**孤立的局部极大**（8 邻域无更亮者，排除星点边缘）、且**被单一通道主导**（排除白色星点）。
+  - 修复：热噪点经去马赛克后其实是一个 ~3–5px 的彩色斑（不是单像素），所以以峰值点为中心、半径 `--hot-grow`（默认 **3**）内的**仍彩色且偏高**的像素一起替换；替换值取"双 5×5 中值"背景（能忽略整块斑，又不像形态学开运算那样把附近的星点也抹掉）。
+  - `--hot-pre` 在**叠加前逐帧**修（从源头去除，和跟踪无关，最彻底但慢）；`--hot-post` 在**叠加后的线性主图**上修（快）。**先保证 `--method median`，多数彩色短线纹就没了；旋转中心附近几乎不动的坏点再开 `--hot-post`。** 推荐：`--method median --hot-post`（需要逐帧清理再用 `--hot-pre`）。
+  - 其余可调：`--hot-sigma`（MAD 倍数，默认 6）、`--hot-abs`（绝对阈值，默认 0.02）、`--hot-ksize`（背景中值窗口，默认 5）、`--hot-color`（单通道主导倍数，默认 2）、`--hot-neigh`（局部极大倍数，默认 1.0）。输出 `hot_compare_pre.jpg` / `hot_compare_post.jpg`（前/后对比图，**交给用户目视判断**）和 `hot_metrics.json`。
 - `--ref N` — 参考帧编号，默认取序列中间帧。
 - `--stretch-bg 0.20` — 拉伸后背景目标亮度，越大越亮。
 - `--save-frames` — 另存每帧对齐后的全分辨率 TIFF（较占空间）。
@@ -85,11 +90,13 @@ python -m venv .venv
 | `transforms.json` | 每帧的相似变换、内点数、评分 |
 | `star_mask.png` | 星点掩膜（使用 `--star-reduce` 时输出，便于检查） |
 | `flat_compare.jpg` | 平场对比图（使用 `--flat` 时输出）：不平场 vs 平场（可含 `--flat-sweep` 强度扫描），**交给用户目视决定是否采用/选用哪个强度** |
+| `hot_compare_pre.jpg` / `hot_compare_post.jpg` | 热噪点去除前/后对比图（使用 `--hot-pre` / `--hot-post` 时输出）：整幅缩略 + 最强彩点处的放大裁切，**交给用户目视判断效果** |
+| `hot_metrics.json` | 热噪点审计：叠加主图上检出的坏点数量、叠加前替换的通道像素数 |
 | `ground_stack.tif` + `_preview.jpg` | 地景层：不配准直接叠加的帧（使用 `--composite` 时输出），前景锐利、星空拖轨 |
 | `sky_mask.png` / `sky_ground_overlay.jpg` | 天地分界线掩膜 / 叠加了分界线的天景预览（使用 `--composite` 时输出，便于检查分割） |
 | `aligned/IMG_xxxx.tif` | 每帧对齐结果（需 `--save-frames`） |
 
-处理阶段顺序：**叠加 → 天地合成 → 自动平场 → 拉伸 → 中性化 → 缩星**（合成/平场/中性化/缩星均可关闭）。
+处理阶段顺序：**叠加 → 热噪点修复 → 天地合成 → 自动平场 → 拉伸 → 中性化 → 缩星**（热噪点修复/合成/平场/中性化/缩星均可关闭；`--hot-pre` 则作用于叠加前的每一帧）。
 
 **最终出图**：成品同时输出**完整分辨率的 TIFF 和 JPEG**，命名为 `merge_final_<start>_<end>.tif` / `.jpg`（`<start>`/`<end>` 是合并序列的起始/结束帧号），可直接交付；其余中间结果一律以 `stageN_` 开头。
 
@@ -115,10 +122,11 @@ python -m venv .venv
 
 ## 代码结构
 
-`scripts/align_stack.py` 只是命令行入口；实现按流水线步骤拆分在 `scripts/astro/`（`registration` / `stacking` / `flat` / `stretch` / `neutralize` / `star_reduce` / `composite` / `horizon` / `render` / `pipeline` 等模块）。
+`scripts/align_stack.py` 只是命令行入口；实现按流水线步骤拆分在 `scripts/astro/`（`registration` / `stacking` / `hotpixels` / `flat` / `stretch` / `neutralize` / `star_reduce` / `composite` / `horizon` / `render` / `pipeline` 等模块）。
 
 ## 注意
 
+- **叠加方式强制用 `median`，禁止用 `mean`**（见上）。若成品里出现红/绿/蓝的短线/短弧，几乎都是误用了 `mean`：热噪点被摊成 `热值/N` 的彩色条纹。改用 `median` 即可消除，通常无需其他后处理；个别坏点（旋转中心附近）再用 `--hot-post`。
 - 输入 CR2 放在仓库外（如 `D:\pic\...`），不要拷进仓库。
 - `out/`、`*.tif`、`.venv/` 已 git 忽略，勿提交。
 - OpenCV `cv2.imwrite` 需要 **BGR**；写 TIFF 用脚本内 `write_tiff16`，否则红蓝通道会互换。

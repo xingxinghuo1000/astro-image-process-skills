@@ -10,6 +10,7 @@ orchestration and the module docstrings for the individual steps:
 
     registration  ORB + star-centroid similarity registration (align the sky)
     stacking      weighted mean / block-wise median accumulation
+    hotpixels     single-frame, per-channel colored hot-pixel detection/repair
     flat          auto flat (PixInsight ABE style) background-gradient removal
     stretch       adaptive (auto MTF) brightness stretch
     neutralize    per-channel sky-background neutralization
@@ -18,7 +19,8 @@ orchestration and the module docstrings for the individual steps:
     render        per-stage TIFF/JPEG, montage and comparison figures
 
 Stages (each enabled step adds one; the stretch is always applied):
-    stacked  -> (composite) -> (flat) -> stretched -> (neutralized) -> (star_reduced)
+    stacked -> (hotfix) -> (composite) -> (flat) -> stretched -> (neutralized)
+        -> (star_reduced)
 
 Every stage is written as ``stage<i>_<name>.tif`` + ``_preview.jpg`` and tiled
 into ``stages_montage.jpg``; the finished image is written as a full-resolution
@@ -46,7 +48,13 @@ def build_parser():
                     help="reference frame number (default: middle of sequence)")
     ap.add_argument("--save-frames", action="store_true",
                     help="also write each sky-aligned full-res frame (.tif)")
-    ap.add_argument("--method", choices=["mean", "median"], default="mean")
+    ap.add_argument("--method", choices=["mean", "median"], default="median",
+                    help="stacking combiner. MEDIAN is required for astro "
+                         "sequences: a hot pixel is fixed on the sensor while "
+                         "the frame rotates, so mean leaves a colored streak "
+                         "(value/N) that survives every threshold; median "
+                         "rejects it as an outlier. 'mean' is kept only for "
+                         "special cases and is discouraged")
     ap.add_argument("--exclude", default="", help="comma separated frame numbers to drop")
     ap.add_argument("--stretch-bg", type=float, default=0.20,
                     help="target sky background level of the stretched output "
@@ -84,6 +92,34 @@ def build_parser():
                    help="also render these flat strengths (0..1) into "
                         "flat_compare.jpg so you can pick --flat-strength from a "
                         "single run, e.g. 0.4,0.5,0.6,0.7")
+
+    h = ap.add_argument_group("hot-pixel removal (single frame, per channel)")
+    h.add_argument("--hot-pre", action="store_true",
+                   help="detect and repair colored hot pixels in EACH raw frame "
+                        "before stacking (removes the sensor defects at the "
+                        "source; independent of tracking)")
+    h.add_argument("--hot-post", action="store_true",
+                   help="detect and repair colored hot pixels on the stacked "
+                        "linear master (faster; prefer --method median first)")
+    h.add_argument("--hot-sigma", type=float, default=6.0, metavar="N",
+                   help="robust (MAD) threshold multiplier (default 6)")
+    h.add_argument("--hot-abs", type=float, default=0.02, metavar="T",
+                   help="absolute residual floor in [0,1] (default 0.02; raise "
+                        "it to keep only stronger defects)")
+    h.add_argument("--hot-ksize", type=int, default=5, choices=[3, 5],
+                   help="median-filter size for the local background (default 5)")
+    h.add_argument("--hot-color", type=float, default=2.0, metavar="R",
+                   help="a defect must exceed R times the other two channels "
+                        "(default 2; a white star is rejected)")
+    h.add_argument("--hot-neigh", type=float, default=1.0, metavar="R",
+                   help="a defect must exceed R times the brightest of its 8 "
+                        "neighbours (default 1.0 = strict local maximum; a star "
+                        "edge is rejected)")
+    h.add_argument("--hot-grow", type=int, default=3, metavar="PX",
+                   help="repair radius: also replace colored, elevated pixels "
+                        "within PX of a detected peak, covering the whole "
+                        "demosaic blob (a hot photosite spreads over ~3-5 px; "
+                        "default 3)")
 
     c = ap.add_argument_group("sky/ground composite (天地合成)")
     c.add_argument("--composite", action="store_true",

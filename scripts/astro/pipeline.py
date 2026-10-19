@@ -25,6 +25,7 @@ from . import star_reduce
 from . import composite as composite_step
 from . import horizon
 from . import render
+from . import hotpixels
 
 
 def _stack_ground_from_dir(args):
@@ -48,6 +49,12 @@ def run(args):
     frames_dir = os.path.join(args.out, "aligned")
     if args.save_frames:
         os.makedirs(frames_dir, exist_ok=True)
+
+    if args.method == "mean":
+        log("WARNING: --method mean is discouraged for astro sequences. A hot "
+            "pixel is fixed on the sensor while the frame rotates, so mean "
+            "keeps it as a colored streak (hot/N) that no threshold can catch. "
+            "Use --method median (default).")
 
     excl = {int(x) for x in args.exclude.split(",") if x.strip()}
     files = [(i, p) for i, p in imgio.find_files(args.dir, args.start, args.end)
@@ -98,6 +105,9 @@ def run(args):
     var_sum = var_sq = None
     var_n = 0
     records = []
+    hot_pre_count = 0
+    hot_pre_before = None
+    hot_pre_after = None
 
     # median needs all aligned frames kept (memory heavy) -> use memmap on disk
     median_store = None
@@ -150,6 +160,17 @@ def run(args):
         if acc_sum is None:
             acc_sum = np.zeros_like(lin)
 
+        if args.hot_pre:
+            cap = hot_pre_before is None
+            if cap:
+                hot_pre_before = lin.copy()
+            lin, nh = hotpixels.detect_and_fix(
+                lin, args.hot_sigma, args.hot_ksize, args.hot_abs,
+                args.hot_color, args.hot_neigh, args.hot_grow)
+            hot_pre_count += nh
+            if cap:
+                hot_pre_after = lin.copy()
+
         if args.method == "mean":
             warped = stacking.warp_into(lin, M_full, W, H)
             w = stacking.valid_mask(M_full, W, H, ones)
@@ -193,6 +214,19 @@ def run(args):
 
     add_stage("stacked", stack, linear=True)
     master = stack
+
+    # ---- optional hot-pixel removal on the stacked image (single frame) ---------
+    if args.hot_post:
+        pre_hot = master.copy()
+        master, nh = hotpixels.detect_and_fix(
+            master, args.hot_sigma, args.hot_ksize, args.hot_abs,
+            args.hot_color, args.hot_neigh, args.hot_grow)
+        log(f"  post-stacking hot-pixel removal: {nh} channel-pixels replaced")
+        add_stage("hotfix", master, linear=True)
+        p, _ = hotpixels.write_compare(
+            args.out, pre_hot, master, "post", args.hot_sigma, args.hot_ksize,
+            args.hot_abs, args.hot_color, args.hot_neigh)
+        log(f"  wrote {p}  (before vs after post-stacking hot-pixel removal)")
 
     # ---- optional sky/ground composite -----------------------------------------
     # Stitch the star-aligned sky onto a static ground layer (the plain average of
@@ -273,6 +307,25 @@ def run(args):
         render.write_stage(args.out, name, img)
     montage = render.write_montage(args.out, stages, target_bg=args.stretch_bg)
     log(f"  wrote {montage}  (all stages side by side)")
+
+    # ---- hot-pixel comparison products + audit ----
+    if hot_pre_before is not None:
+        p, _ = hotpixels.write_compare(
+            args.out, hot_pre_before, hot_pre_after, "pre", args.hot_sigma,
+            args.hot_ksize, args.hot_abs, args.hot_color, args.hot_neigh)
+        log(f"  pre-stacking hot-pixel removal: {hot_pre_count} channel-pixels "
+            f"replaced over {len(records)} frames")
+        log(f"  wrote {p}  (before vs after pre-stacking hot-pixel removal)")
+        del hot_pre_before, hot_pre_after
+
+    met = hotpixels.metrics(linear, args.hot_sigma, args.hot_ksize,
+                            args.hot_abs, args.hot_color, args.hot_neigh)
+    log("  hot-pixel audit on the linear master: %d hot pixels (%d channel-px)"
+        % (met["hot_pixels"], met["hot_channel_px"]))
+    with open(os.path.join(args.out, "hot_metrics.json"), "w") as f:
+        json.dump(dict(method=args.method, hot_pre=bool(args.hot_pre),
+                       hot_post=bool(args.hot_post), pre_px=hot_pre_count,
+                       **met), f, indent=2)
 
     # ---- final deliverables: the finished image, named for the merged range --
     # Final products are merge_final_<start>_<end>.tif/.jpg (the frame numbers
