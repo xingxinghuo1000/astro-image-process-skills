@@ -88,18 +88,55 @@ Restart opencode afterwards — skills are loaded at startup.
 You do **not** call the script by hand: ask the agent in natural language. The
 skill's description advertises the trigger keywords (星野, 星空, 银河, 对齐,
 叠加, *star field alignment*, *astro stacking*, *CR2 alignment*), so the agent
-loads it when your request matches:
+loads it automatically when a request matches. It then reads `SKILL.md`, prepares
+the `.venv`, runs `scripts/align_stack.py` with the right flags and inspects the
+results — and because it can see images, it will also produce the `--ground-mask`
+for the sky/ground composite. Things you can ask for:
 
-- "Stack this nightscape CR2 sequence: `D:\pic\DCIM-2026\08-shangduhu-2`, frames 5994–6012."
-- "把这些星野照片对齐叠加并自动拉伸：`D:\pic\...`，范围 5994–6012。"
-- "The sky and the foreground should both be sharp — do a 天地合成."
+**1. Plain align + stack (the everyday case)**
 
-The agent then reads `SKILL.md`, sets up the `.venv`, runs
-`scripts/align_stack.py` with the right flags, and inspects the results (it can
-even read `ground_stack_preview.jpg`, recognise the foreground and pass a
-`--ground-mask`). You can keep going conversationally — "remove the
-light-pollution gradient", "the tree is blurred, fix the composite" — and it will
-adjust the flags and re-run.
+> "Stack this nightscape CR2 sequence: `D:\pic\DCIM-2026\08-shangduhu-2`, frames 5994–6012."
+
+**2. Stack + full post-processing (flat, neutralize, star reduction)**
+
+> "把这些星野照片对齐叠加，去掉光害梯度、做背景中性化，星点稍微收一点：`D:\pic\DCIM-2026\08-shangduhu-2`，5994–6012。"
+
+**3. Full workflow + sky/ground composite — sharp tree *and* sharp sky**
+
+This is a multi-turn exchange:
+
+> **You:** "`D:\pic\DCIM-2026\08-shangduhu-2` 的 5994–6012 走完整流程：平场 + 中性化 + 缩星，最后做天地合成，前景要清晰。"
+
+The agent runs the whole chain once with `--composite`, looks at the
+`ground_stack_preview.jpg` it just produced, uses its vision to mark the
+foreground (tree, dome, terrain) as a white-on-black `ground_mask.png`, then
+re-runs with `--ground-mask` so the boundary hugs the tree — under the hood:
+
+```bash
+./.venv/Scripts/python.exe scripts/align_stack.py \
+    --dir "D:\pic\DCIM-2026\08-shangduhu-2" --method median \
+    --flat --flat-strength 0.5 --neutralize --star-reduce 1 \
+    --composite --ground-mask out/ground_mask.png --out out
+```
+
+It reports the final `out/merge_final_5994_6012.tif/.jpg` and shows you
+`out/sky_ground_overlay.jpg` so you can confirm the split.
+
+**4. Check a flat before committing to it**
+
+> "这个画面用平场会不会压出亮环？给我看几个强度的对比。" — the agent runs
+> `--flat-sweep 0.4,0.5,0.6,0.7` and shows you `flat_compare.jpg`.
+
+**5. Colored hot-pixel streaks**
+
+> "银河里有很多彩色小点拖线，帮我去掉。" — the agent adds `--hot-post` (or
+> `--hot-pre`) and shows `hot_compare_post.jpg`.
+
+**6. Keep refining conversationally**
+
+> "树太糊了 / 天空又出现星轨了 / 背景还偏紫 / 星星再收一点" — the agent tweaks
+> `--composite-feather`, `--composite-thresh`, `--flat-strength`, `--neutralize`
+> or `--star-reduce` and re-runs, re-checking the overlay and montage each time.
 
 Prefer driving it by hand? See [Manual CLI usage](#manual-cli-usage).
 
@@ -173,41 +210,60 @@ Sky/ground composite (天地合成)
     --dir "D:\pic\DCIM-2026\08-shangduhu-2" --method median --out out
 ```
 
-**2. Remove a light-pollution gradient and a color cast**
+**2. Stack + full post-processing (flat, neutralize, star reduction)**
 
 ```bash
 ./.venv/Scripts/python.exe scripts/align_stack.py \
     --dir "D:\pic\DCIM-2026\08-shangduhu-2" --method median \
-    --flat --flat-strength 0.5 --neutralize --out out
+    --flat --flat-strength 0.5 --neutralize --star-reduce 1 --out out
 ```
 
-Check `out/flat_compare.jpg` to decide whether to keep the flat, and tune
-`--flat-strength` (a full correction of a Milky-Way-filled field can leave a
-bright border ring; `~0.5` usually removes it).
+**3. Full workflow + sky/ground composite (all stages, sharp foreground)**
 
-**3. Sharpen both the sky and a static foreground (sky/ground composite)**
-
-1. Run once with `--composite` (or use a previous run) to get
-   `out/ground_stack_preview.jpg`.
-2. Let a large vision model look at that preview and mark the **ground /
-   foreground** (tree, building, terrain, horizon) as a grayscale mask PNG where
-   **white = ground, black = sky** — e.g. `out/ground_mask.png`.
-3. Re-run with the mask:
+Step 1 — run once to build the ground layer and produce the preview:
 
 ```bash
 ./.venv/Scripts/python.exe scripts/align_stack.py \
     --dir "D:\pic\DCIM-2026\08-shangduhu-2" --method median \
+    --flat --flat-strength 0.5 --neutralize --star-reduce 1 \
+    --composite --out out
+```
+
+Step 2 — have a large vision model look at `out/ground_stack_preview.jpg` and
+mark the **ground / foreground** (tree, building, terrain, horizon) as a
+grayscale mask with **white = ground, black = sky**, e.g. `out/ground_mask.png`.
+(When you use the skill, the agent does this step for you.)
+
+Step 3 — full run with the recognised mask:
+
+```bash
+./.venv/Scripts/python.exe scripts/align_stack.py \
+    --dir "D:\pic\DCIM-2026\08-shangduhu-2" --method median \
+    --flat --flat-strength 0.5 --neutralize --star-reduce 1 \
     --composite --ground-mask out/ground_mask.png --out out
 ```
 
-Inspect `out/sky_ground_overlay.jpg` — the boundary is drawn in cyan; the tree
-should be outlined tightly and the sky should be free of star trails.
+Check `out/sky_ground_overlay.jpg`: the boundary is drawn in cyan and should hug
+the foreground; the sky must be free of star trails. The final image is
+`out/merge_final_5994_6012.tif/.jpg`.
 
-> The composite needs a **fixed tripod** and a **static foreground**, otherwise
-> the un-registered "ground" stack is not sharp. If you have a separate set of
-> foreground frames, point `--ground-dir` at them.
+> The composite needs a **fixed tripod** and a **static foreground** (the ground
+> layer is the un-registered average). With dedicated foreground frames, use
+> `--ground-dir` (scenario 6).
 
-**4. Colored hot-pixel streaks**
+**4. Light-pollution gradient only — compare flat strengths first**
+
+```bash
+./.venv/Scripts/python.exe scripts/align_stack.py \
+    --dir "D:\pic\DCIM-2026\08-shangduhu-2" --method median \
+    --flat --flat-sweep 0.4,0.5,0.6,0.7 --out out
+```
+
+Look at `out/flat_compare.jpg` (no flat vs each strength), then re-run with the
+chosen `--flat-strength` (a full correction of a Milky-Way-filled field can leave
+a bright border ring; `~0.5` usually removes it).
+
+**5. Colored hot-pixel streaks**
 
 ```bash
 ./.venv/Scripts/python.exe scripts/align_stack.py \
@@ -218,7 +274,7 @@ Prefer `--method median` first; add `--hot-post` for residual colored dots near
 the rotation centre, or `--hot-pre` to clean every raw frame at the source
 (slower). Compare `out/hot_compare_post.jpg`.
 
-**5. Foreground from a dedicated sequence**
+**6. Foreground from a dedicated sequence**
 
 ```bash
 ./.venv/Scripts/python.exe scripts/align_stack.py \
@@ -226,6 +282,9 @@ the rotation centre, or `--hot-pre` to clean every raw frame at the source
     --ground-dir "D:\pic\...\ground" --ground-start 7001 --ground-end 7020 \
     --out out
 ```
+
+Add `--ground-mask out/ground_mask.png` here too if you want the boundary to
+follow a recognised foreground instead of the automatic detection.
 
 ---
 

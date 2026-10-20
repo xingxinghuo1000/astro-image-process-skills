@@ -82,16 +82,53 @@ git clone git@github.com:xingxinghuo1000/astro-image-process-skills.git \
 
 **不需要自己敲命令**——用自然语言让 agent 干活即可。skill 的 description 里挂了触发关键词
 （星野、星空、银河、对齐、叠加、*star field alignment*、*astro stacking*、
-*CR2 alignment*），你的请求命中时 agent 会自动加载本 skill：
+*CR2 alignment*），你的请求命中时 agent 会自动加载本 skill：它会读 `SKILL.md`、
+准备好 `.venv`、用正确的参数跑 `scripts/align_stack.py` 并查看结果——因为它能看图，
+还会为天地合成产出 `--ground-mask`。可以这样提需求：
 
-- "帮我把这些星野 CR2 对齐叠加：`D:\pic\DCIM-2026\08-shangduhu-2`，范围 5994–6012。"
-- "Stack this nightscape CR2 sequence: `D:\pic\...`, frames 5994–6012."
-- "星空和前景我都要清晰，做一下天地合成。"
+**1. 只做对齐 + 叠加（日常）**
 
-随后 agent 会读 `SKILL.md`、准备好 `.venv`、用正确的参数跑
-`scripts/align_stack.py`，并查看结果（它甚至能读 `ground_stack_preview.jpg`，
-用视觉识别前景并传 `--ground-mask`）。你可以继续对话微调——"把光害梯度去掉"、
-"树糊了，修一下合成"——agent 会改参数重跑。
+> "帮我把这些星野 CR2 对齐叠加：`D:\pic\DCIM-2026\08-shangduhu-2`，范围 5994–6012。"
+
+**2. 叠加 + 完整后期（平场、中性化、缩星）**
+
+> "把这些星野照片对齐叠加，去掉光害梯度、做背景中性化，星点稍微收一点：`D:\pic\DCIM-2026\08-shangduhu-2`，5994–6012。"
+
+**3. 全流程 + 天地合成（所有阶段，前景和星空都清晰）**
+
+这是一个多轮对话：
+
+> **你：** "`D:\pic\DCIM-2026\08-shangduhu-2` 的 5994–6012 走完整流程：平场 + 中性化 + 缩星，最后做天地合成，前景要清晰。"
+
+agent 会先带 `--composite` 跑完整条链，看它刚生成的 `ground_stack_preview.jpg`，
+用视觉把前景（树、圆顶、地形）标成一张**白色=地景**的 `ground_mask.png`，再带
+`--ground-mask` 重跑，让分界线紧贴树冠。它内部实际执行的命令：
+
+```bash
+./.venv/Scripts/python.exe scripts/align_stack.py \
+    --dir "D:\pic\DCIM-2026\08-shangduhu-2" --method median \
+    --flat --flat-strength 0.5 --neutralize --star-reduce 1 \
+    --composite --ground-mask out/ground_mask.png --out out
+```
+
+最后报告成品 `out/merge_final_5994_6012.tif/.jpg`，并给你看
+`out/sky_ground_overlay.jpg` 确认分割。
+
+**4. 决定平场要不要、用多大强度**
+
+> "这个画面用平场会不会压出亮环？给我看几个强度的对比。" —— agent 跑
+> `--flat-sweep 0.4,0.5,0.6,0.7`，把 `flat_compare.jpg` 给你看。
+
+**5. 彩色热噪点拖线**
+
+> "银河里有很多彩色小点拖线，帮我去掉。" —— agent 加 `--hot-post`（或
+> `--hot-pre`），并给你看 `hot_compare_post.jpg`。
+
+**6. 继续对话微调**
+
+> "树太糊了 / 天空又出现星轨了 / 背景还偏紫 / 星星再收一点" —— agent 会改
+> `--composite-feather`、`--composite-thresh`、`--flat-strength`、`--neutralize`
+> 或 `--star-reduce` 重跑，并重新核对叠加图和阶段拼接图。
 
 想自己手动跑，见下面的「手动 CLI 用法」。
 
@@ -160,36 +197,56 @@ align_stack.py
     --dir "D:\pic\DCIM-2026\08-shangduhu-2" --method median --out out
 ```
 
-**2. 去除光害梯度与偏色**
+**2. 叠加 + 完整后期（平场、中性化、缩星）**
 
 ```bash
 ./.venv/Scripts/python.exe scripts/align_stack.py \
     --dir "D:\pic\DCIM-2026\08-shangduhu-2" --method median \
-    --flat --flat-strength 0.5 --neutralize --out out
+    --flat --flat-strength 0.5 --neutralize --star-reduce 1 --out out
 ```
 
-先看 `out/flat_compare.jpg` 决定是否保留平场，再微调 `--flat-strength`
-（被银河铺满的画面做满强度校正，可能在边缘留下一圈亮环，`~0.5` 通常能消掉）。
+**3. 全流程 + 天地合成（所有阶段，前景和星空都清晰）**
 
-**3. 星空与静态前景都锐利（天地合成）**
-
-1. 先用 `--composite` 跑一次（或复用已有结果），得到 `out/ground_stack_preview.jpg`。
-2. 让具备视觉能力的大模型看这张预览，把**地景 / 前景**（树、建筑、地形、地平线）标成一张灰度掩膜 PNG，
-   **白色 = 地景，黑色 = 天空**，例如 `out/ground_mask.png`。
-3. 带着掩膜重跑：
+第 1 步 —— 先跑一次，构建地景层并生成预览：
 
 ```bash
 ./.venv/Scripts/python.exe scripts/align_stack.py \
     --dir "D:\pic\DCIM-2026\08-shangduhu-2" --method median \
+    --flat --flat-strength 0.5 --neutralize --star-reduce 1 \
+    --composite --out out
+```
+
+第 2 步 —— 让具备视觉能力的大模型看 `out/ground_stack_preview.jpg`，把**地景 / 前景**
+（树、建筑、地形、地平线）标成一张灰度掩膜，**白色 = 地景，黑色 = 天空**，
+例如 `out/ground_mask.png`。（用 skill 时，agent 会自动完成这一步。）
+
+第 3 步 —— 带着识别出的掩膜跑完整流程：
+
+```bash
+./.venv/Scripts/python.exe scripts/align_stack.py \
+    --dir "D:\pic\DCIM-2026\08-shangduhu-2" --method median \
+    --flat --flat-strength 0.5 --neutralize --star-reduce 1 \
     --composite --ground-mask out/ground_mask.png --out out
 ```
 
-看 `out/sky_ground_overlay.jpg` 检查：分界线（青色）应紧贴树冠轮廓，天空里不应出现星轨。
+看 `out/sky_ground_overlay.jpg` 检查：分界线（青色）应紧贴前景轮廓，天空里不应出现星轨。
+最终成品是 `out/merge_final_5994_6012.tif/.jpg`。
 
-> 天地合成要求**固定三脚架**且**前景静止**，否则"不配准的地景层"本身就会糊。
-> 如果有单独拍的地景帧，用 `--ground-dir` 指过去。
+> 天地合成要求**固定三脚架**且**前景静止**（地景层是不配准的平均）。
+> 如果有单独拍的地景帧，用 `--ground-dir`（见场景 6）。
 
-**4. 彩色热噪点拖线**
+**4. 只想去光害梯度——先比较平场强度**
+
+```bash
+./.venv/Scripts/python.exe scripts/align_stack.py \
+    --dir "D:\pic\DCIM-2026\08-shangduhu-2" --method median \
+    --flat --flat-sweep 0.4,0.5,0.6,0.7 --out out
+```
+
+看 `out/flat_compare.jpg`（不平场 vs 各强度），再带上选定的 `--flat-strength` 正式出图
+（被银河铺满的画面做满强度校正，可能在边缘留下一圈亮环，`~0.5` 通常能消掉）。
+
+**5. 彩色热噪点拖线**
 
 ```bash
 ./.venv/Scripts/python.exe scripts/align_stack.py \
@@ -199,7 +256,7 @@ align_stack.py
 先保证 `--method median`；旋转中心附近残留的彩点再加 `--hot-post`，或从源头用 `--hot-pre`
 逐帧清理（更慢）。对比 `out/hot_compare_post.jpg`。
 
-**5. 用单独的地景序列**
+**6. 用单独的地景序列**
 
 ```bash
 ./.venv/Scripts/python.exe scripts/align_stack.py \
@@ -207,6 +264,8 @@ align_stack.py
     --ground-dir "D:\pic\...\ground" --ground-start 7001 --ground-end 7020 \
     --out out
 ```
+
+如果想让分界线跟随识别出的前景，再加 `--ground-mask out/ground_mask.png`。
 
 ---
 
