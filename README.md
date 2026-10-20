@@ -1,5 +1,7 @@
 # Star-field Align & Stack
 
+**Languages:** English | [简体中文](docs/README-cn.md)
+
 A Python pipeline that **aligns and stacks** a sequence of Canon **CR2** frames
 shot from a **fixed tripod** (the sky rotates between frames while the foreground
 stays still), then applies a PixInsight-style post-processing chain — auto flat
@@ -273,5 +275,3 @@ scripts/astro/             implementation, one module per step
 docs/                      design notes and diagrams
 out/                       default output directory (git-ignored)
 ```
-
-Chinese documentation: [`docs/README-cn.md`](docs/README-cn.md).
