@@ -2,7 +2,7 @@
 
 **语言：** [English](../README.md) | 简体中文
 
-一个纯 Python 流水线：把**固定三脚架**拍摄的佳能 **CR2** 星野序列（帧间星空在转、地景不动）
+一个 **Agent Skill**（附带独立 Python CLI）：把**固定三脚架**拍摄的佳能 **CR2** 星野序列（帧间星空在转、地景不动）
 做**对齐 + 叠加**，再走一遍 PixInsight 风格的后期链——自动平场（ABE）、背景中性化、缩星，
 以及可选的**天地合成**，让星空和前景同时保持锐利。
 
@@ -47,27 +47,68 @@ macOS/Linux 把 `./.venv/Scripts/python.exe` 换成 `./.venv/bin/python`。
 
 ---
 
-## 快速开始
+## 作为 Skill 安装
+
+本仓库**本身就是一个 Agent Skill**：`SKILL.md` 里是 frontmatter
+（`name: astro-image-process-skills` 和触发关键词）以及给 agent 的说明，
+`scripts/` 是具体实现。把它放到 agent 的 skills 目录里，**文件夹名要与 skill 名一致**：
+
+| 范围 | 路径 |
+| --- | --- |
+| opencode（全局） | `~/.config/opencode/skills/astro-image-process-skills/` |
+| opencode（项目级） | `.opencode/skills/astro-image-process-skills/` |
+| Claude Code / 兼容 | `~/.claude/skills/astro-image-process-skills/` |
+
+```bash
+git clone git@github.com:xingxinghuo1000/astro-image-process-skills.git \
+    ~/.config/opencode/skills/astro-image-process-skills
+```
+
+也可以在 `opencode.json` 里用 `skills.paths` 指向它所在的目录
+（opencode 会递归扫描其中的 `**/SKILL.md`）：
+
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "skills": { "paths": ["~/src/astro-image-process-skills"] }
+}
+```
+
+装好后**重启 opencode**（skill 在启动时加载）。
+
+---
+
+## 使用 Skill
+
+**不需要自己敲命令**——用自然语言让 agent 干活即可。skill 的 description 里挂了触发关键词
+（星野、星空、银河、对齐、叠加、*star field alignment*、*astro stacking*、
+*CR2 alignment*），你的请求命中时 agent 会自动加载本 skill：
+
+- "帮我把这些星野 CR2 对齐叠加：`D:\pic\DCIM-2026\08-shangduhu-2`，范围 5994–6012。"
+- "Stack this nightscape CR2 sequence: `D:\pic\...`, frames 5994–6012."
+- "星空和前景我都要清晰，做一下天地合成。"
+
+随后 agent 会读 `SKILL.md`、准备好 `.venv`、用正确的参数跑
+`scripts/align_stack.py`，并查看结果（它甚至能读 `ground_stack_preview.jpg`，
+用视觉识别前景并传 `--ground-mask`）。你可以继续对话微调——"把光害梯度去掉"、
+"树糊了，修一下合成"——agent 会改参数重跑。
+
+想自己手动跑，见下面的「手动 CLI 用法」。
+
+---
+
+## 手动 CLI 用法
+
+直接跑脚本（适合写脚本或调试）；参数和 skill 内部用的是同一套。
 
 ```bash
 ./.venv/Scripts/python.exe scripts/align_stack.py \
     --dir "D:\pic\DCIM-2026\08-shangduhu-2" \
     --start 5994 --end 6012 \
     --method median --out out
-```
 
-流程会配准、叠加并写出各阶段图像，最终成品是
-`out/merge_final_5994_6012.tif` 和 `.jpg`。所有产物都写到 `--out`（默认 `out/`，已被 git 忽略）。
-
-查看全部参数：
-
-```bash
 ./.venv/Scripts/python.exe scripts/align_stack.py --help
 ```
-
----
-
-## 用法
 
 ```text
 align_stack.py
@@ -110,7 +151,7 @@ align_stack.py
 
 ---
 
-## 典型用法
+## 典型 CLI 用法
 
 **1. 直接叠加 + 轻微缩星（日常）**
 

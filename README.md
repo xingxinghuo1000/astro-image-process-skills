@@ -2,12 +2,12 @@
 
 **Languages:** English | [简体中文](docs/README-cn.md)
 
-A Python pipeline that **aligns and stacks** a sequence of Canon **CR2** frames
-shot from a **fixed tripod** (the sky rotates between frames while the foreground
-stays still), then applies a PixInsight-style post-processing chain — auto flat
-(ABE), background neutralization, star reduction — and an optional
-**sky/ground ("天地") composite** that keeps both the star field and the
-foreground sharp.
+An **Agent Skill** (with a standalone Python CLI) that **aligns and stacks** a
+sequence of Canon **CR2** frames shot from a **fixed tripod** (the sky rotates
+between frames while the foreground stays still), then applies a PixInsight-style
+post-processing chain — auto flat (ABE), background neutralization, star
+reduction — and an optional **sky/ground ("天地") composite** that keeps both the
+star field and the foreground sharp.
 
 ![Processing pipeline](docs/pipeline-en.png)
 
@@ -51,28 +51,73 @@ contains `IMG_<n>.CR2`.
 
 ---
 
-## Quick start
+## Install as a skill
+
+This repository **is an Agent Skill**: `SKILL.md` carries the frontmatter
+(`name: astro-image-process-skills` + trigger keywords) and the agent-facing
+instructions; `scripts/` is the implementation. Put the repository in a skills
+directory, keeping the folder name equal to the skill name:
+
+| Scope | Path |
+| --- | --- |
+| opencode (global) | `~/.config/opencode/skills/astro-image-process-skills/` |
+| opencode (project) | `.opencode/skills/astro-image-process-skills/` |
+| Claude Code / compatible | `~/.claude/skills/astro-image-process-skills/` |
+
+```bash
+git clone git@github.com:xingxinghuo1000/astro-image-process-skills.git \
+    ~/.config/opencode/skills/astro-image-process-skills
+```
+
+Alternatively register the folder via `skills.paths` in `opencode.json`
+(opencode scans those directories recursively for `**/SKILL.md`):
+
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "skills": { "paths": ["~/src/astro-image-process-skills"] }
+}
+```
+
+Restart opencode afterwards — skills are loaded at startup.
+
+---
+
+## Use the skill
+
+You do **not** call the script by hand: ask the agent in natural language. The
+skill's description advertises the trigger keywords (星野, 星空, 银河, 对齐,
+叠加, *star field alignment*, *astro stacking*, *CR2 alignment*), so the agent
+loads it when your request matches:
+
+- "Stack this nightscape CR2 sequence: `D:\pic\DCIM-2026\08-shangduhu-2`, frames 5994–6012."
+- "把这些星野照片对齐叠加并自动拉伸：`D:\pic\...`，范围 5994–6012。"
+- "The sky and the foreground should both be sharp — do a 天地合成."
+
+The agent then reads `SKILL.md`, sets up the `.venv`, runs
+`scripts/align_stack.py` with the right flags, and inspects the results (it can
+even read `ground_stack_preview.jpg`, recognise the foreground and pass a
+`--ground-mask`). You can keep going conversationally — "remove the
+light-pollution gradient", "the tree is blurred, fix the composite" — and it will
+adjust the flags and re-run.
+
+Prefer driving it by hand? See [Manual CLI usage](#manual-cli-usage).
+
+---
+
+## Manual CLI usage
+
+Run the script directly (useful for scripting or debugging); the arguments are
+the same ones the skill uses under the hood.
 
 ```bash
 ./.venv/Scripts/python.exe scripts/align_stack.py \
     --dir "D:\pic\DCIM-2026\08-shangduhu-2" \
     --start 5994 --end 6012 \
     --method median --out out
-```
 
-This registers and stacks the frames and writes the per-stage images plus the
-finished `out/merge_final_5994_6012.tif` and `.jpg`. Everything is written to
-`--out` (default `out/`, git-ignored).
-
-Show all options:
-
-```bash
 ./.venv/Scripts/python.exe scripts/align_stack.py --help
 ```
-
----
-
-## Usage
 
 ```text
 align_stack.py
@@ -119,7 +164,7 @@ Sky/ground composite (天地合成)
 
 ---
 
-## Typical workflows
+## Typical CLI workflows
 
 **1. Straight stack + gentle star reduction (the everyday case)**
 
