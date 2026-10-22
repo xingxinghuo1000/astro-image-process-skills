@@ -37,7 +37,8 @@ Guidance for AI coding agents working in this repository.
   - `registration.py` ORB + star-centroid similarity registration
   - `stacking.py` mean / block-wise median accumulation
   - `flat.py` auto flat (ABE); `stretch.py` auto MTF; `neutralize.py` background
-    neutralization; `star_reduce.py` star shrink
+    neutralization; `whitebalance.py` automatic star/sky white balance;
+    `star_reduce.py` star shrink
   - `composite.py` sky/ground ("天地") stitch; `horizon.py` sky-ground boundary
     detection
   - `render.py` per-stage TIFF/JPEG, montage, comparison figures

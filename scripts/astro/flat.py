@@ -1,8 +1,10 @@
 """Automatic background / gradient removal (PixInsight ABE, a.k.a. "auto flat")."""
+from concurrent.futures import ThreadPoolExecutor
 import numpy as np
 
 
-def auto_flat(rgb, bins=16, degree=3, pct=25.0, mode="subtract", strength=1.0):
+def auto_flat(rgb, bins=16, degree=3, pct=25.0, mode="subtract", strength=1.0,
+              workers=3):
     """Remove the smooth low-frequency background, PixInsight
     AutomaticBackgroundExtractor (ABE, a.k.a. "auto flat") style.
 
@@ -42,8 +44,9 @@ def auto_flat(rgb, bins=16, degree=3, pct=25.0, mode="subtract", strength=1.0):
     gy = (np.linspace(0, h - 1, h) / max(h - 1, 1)) * 2.0 - 1.0
 
     out = rgb.copy()
-    info = []
-    for c in range(3):
+    info = [None, None, None]
+
+    def one(c):
         vals = np.empty(nx * ny, np.float64)
         for yi in range(ny):
             for xi in range(nx):
@@ -63,5 +66,18 @@ def auto_flat(rgb, bins=16, degree=3, pct=25.0, mode="subtract", strength=1.0):
             ped = max(0.0, float(np.percentile(model, 10.0)))
             corrected = np.clip(rgb[..., c] - np.clip(model - ped, 0, None), 0, 1)
         out[..., c] = np.clip(rgb[..., c] + strength * (corrected - rgb[..., c]), 0, 1)
-        info.append((float(model.min()), float(model.max()), float(model.mean())))
+        return c, (float(model.min()), float(model.max()), float(model.mean()))
+
+    workers = max(1, min(int(workers), 3))
+    if workers == 1:
+        results = (one(c) for c in range(3))
+    else:
+        ex = ThreadPoolExecutor(max_workers=workers)
+        results = ex.map(one, range(3))
+    try:
+        for c, inf in results:
+            info[c] = inf
+    finally:
+        if workers > 1:
+            ex.shutdown()
     return out, info

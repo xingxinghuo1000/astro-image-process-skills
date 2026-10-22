@@ -4,12 +4,16 @@
 
 An **Agent Skill** (with a standalone Python CLI) that **aligns and stacks** a
 sequence of Canon **CR2** frames shot from a **fixed tripod** (the sky rotates
-between frames while the foreground stays still), then applies a PixInsight-style
-post-processing chain — auto flat (ABE), background neutralization, star
-reduction — and an optional **sky/ground ("天地") composite** that keeps both the
-star field and the foreground sharp.
+between frames while the foreground stays still) or a **sky-tracked rig**, then
+applies a PixInsight-style post-processing chain — auto flat (ABE), background
+neutralization, automatic white balance, star reduction — and an optional
+**sky/ground ("天地") composite** that keeps both the star field and the
+foreground sharp.
 
 ![Processing pipeline](docs/pipeline-en.png)
+
+**Deep dives:** [Single-image parallelization report](docs/single-image-parallelization-report.md) ·
+[Wide-field registration algorithm](docs/wide-field-registration.md)
 
 ---
 
@@ -18,14 +22,15 @@ star field and the foreground sharp.
 | Capability | Description |
 | --- | --- |
 | **RAW decode** | Reads `IMG_<n>.CR2` with `rawpy` (camera WB, linear, AHD demosaic). |
-| **Static-pattern removal** | A two-pass scheme builds a static-pattern map (hot pixels / fixed pattern) from the whole sequence and subtracts it so registration only locks onto real stars. |
-| **Sky registration** | ORB feature matching + star-centroid refinement, fitting a similarity transform (rotation + translation + scale) per frame, with plausibility checks (match score, inliers, star residual) that reject bad frames. |
-| **Stacking** | Block-wise **median** (recommended) or weighted **mean**; median uses an on-disk memmap so long sequences fit in RAM. |
+| **Static-pattern removal** | A two-pass scheme builds a static-pattern map (hot pixels / fixed pattern) from the whole sequence and subtracts it so registration only locks onto real stars. Automatically skipped for sky-tracked sequences, where the stars themselves are static (the percentile map would erase them); `--hot-post` is then enabled automatically. |
+| **Sky registration** | ORB feature matching + star-centroid refinement, fitting a projective **homography** per frame (the correct model for a rotating sky: `K R K^-1`), with plausibility checks (match score, inliers, star residual) that reject bad frames. Frames register in parallel with `--workers` (default: one per CPU core). |
+| **Stacking** | Block-wise **median** (recommended) or weighted **mean**; median uses an on-disk memmap so long sequences fit in RAM, and independent row bands are processed in parallel (`--stack-workers`). |
 | **Hot-pixel removal** | Per-channel, single-frame detection of colored hot pixels (isolated local maxima dominated by one channel), with cosmetic repair and before/after figures. `--hot-pre` (per raw frame) or `--hot-post` (stacked). |
 | **Sky/ground composite** | Stitches the star-aligned sky onto a static (un-registered) ground layer at the sky/ground boundary. The boundary can be recognised by a **large vision model** (recommended) or detected automatically from temporal variance. |
 | **Auto flat (ABE)** | PixInsight `AutomaticBackgroundExtractor`-style 2D polynomial background fit on the **linear** image, subtract/divide, with a blend strength and a strength sweep. |
 | **Auto stretch** | Adaptive mid-tone-transfer (MTF) stretch that places the sky background at a target level. |
 | **Background neutralization** | Per-channel scaling so the sky background becomes neutral grey (removes light-pollution color casts). |
+| **Auto white balance** | Luminance-preserving star/sky white balance after neutralization (whitepatch, grayworld or mixed), with a `wb_compare.jpg` for visual review and manual `--wb-gains` override. |
 | **Star reduction** | High-pass star mask + morphological shrink to make nebulae/the Milky Way stand out. |
 | **Deliverables** | Every intermediate stage as 16-bit TIFF + preview, a stage montage, and a full-resolution final `merge_final_<start>_<end>.tif/.jpg`. |
 
@@ -97,7 +102,7 @@ for the sky/ground composite. Things you can ask for:
 
 > "Stack this nightscape CR2 sequence: `D:\pic\DCIM-2026\08-shangduhu-2`, frames 5994–6012."
 
-**2. Stack + full post-processing (flat, neutralize, star reduction)**
+**2. Stack + full post-processing (flat, neutralize, white balance, star reduction)**
 
 > "把这些星野照片对齐叠加，去掉光害梯度、做背景中性化，星点稍微收一点：`D:\pic\DCIM-2026\08-shangduhu-2`，5994–6012。"
 
@@ -115,7 +120,7 @@ re-runs with `--ground-mask` so the boundary hugs the tree — under the hood:
 ```bash
 ./.venv/Scripts/python.exe scripts/align_stack.py \
     --dir "D:\pic\DCIM-2026\08-shangduhu-2" --method median \
-    --flat --flat-strength 0.5 --neutralize --star-reduce 1 \
+    --flat --flat-strength 0.5 --neutralize --wb --star-reduce 1 \
     --composite --ground-mask out/ground_mask.png --out out
 ```
 
@@ -135,7 +140,7 @@ It reports the final `out/merge_final_5994_6012.tif/.jpg` and shows you
 **6. Keep refining conversationally**
 
 > "树太糊了 / 天空又出现星轨了 / 背景还偏紫 / 星星再收一点" — the agent tweaks
-> `--composite-feather`, `--composite-thresh`, `--flat-strength`, `--neutralize`
+> `--composite-feather`, `--composite-thresh`, `--flat-strength`, `--neutralize`, `--wb-strength`
 > or `--star-reduce` and re-runs, re-checking the overlay and montage each time.
 
 Prefer driving it by hand? See [Manual CLI usage](#manual-cli-usage).
@@ -164,10 +169,21 @@ align_stack.py
   --ref N                  reference frame (default: middle of the range)
   --method {mean,median}   combiner (default: median; mean is discouraged)
   --exclude 6007,6012      drop specific frames
+  --workers N              parallel registration threads (default 0 = auto)
+  --io-workers N           parallel CR2 decoders (default 0 = 8)
+  --stack-workers N        parallel median row bands (default 0 = 8)
+  --render-workers N       parallel stage TIFF/JPEG writers (default 0 = 4)
+  --no-static              disable static-pattern subtraction
   --stretch-bg 0.20        target sky-background level after stretch
   --save-frames            also save each aligned full-res frame
   --neutralize             background neutralization (after stretch)
   --star-reduce PX         star shrink in pixels (default 1; 0 disables)
+
+White balance (after neutralization)
+  --wb                     enable automatic white balance
+  --wb-mode {whitepatch,grayworld,mixed}   (default: whitepatch)
+  --wb-strength S          0..1 log-space blend (default 0.6)
+  --wb-gains R,G,B         manual gains (overrides the measurement)
 
 Flat (auto background / ABE)
   --flat                   enable
@@ -210,12 +226,12 @@ Sky/ground composite (天地合成)
     --dir "D:\pic\DCIM-2026\08-shangduhu-2" --method median --out out
 ```
 
-**2. Stack + full post-processing (flat, neutralize, star reduction)**
+**2. Stack + full post-processing (flat, neutralize, white balance, star reduction)**
 
 ```bash
 ./.venv/Scripts/python.exe scripts/align_stack.py \
     --dir "D:\pic\DCIM-2026\08-shangduhu-2" --method median \
-    --flat --flat-strength 0.5 --neutralize --star-reduce 1 --out out
+    --flat --flat-strength 0.5 --neutralize --wb --star-reduce 1 --out out
 ```
 
 **3. Full workflow + sky/ground composite (all stages, sharp foreground)**
@@ -225,7 +241,7 @@ Step 1 — run once to build the ground layer and produce the preview:
 ```bash
 ./.venv/Scripts/python.exe scripts/align_stack.py \
     --dir "D:\pic\DCIM-2026\08-shangduhu-2" --method median \
-    --flat --flat-strength 0.5 --neutralize --star-reduce 1 \
+    --flat --flat-strength 0.5 --neutralize --wb --star-reduce 1 \
     --composite --out out
 ```
 
@@ -239,7 +255,7 @@ Step 3 — full run with the recognised mask:
 ```bash
 ./.venv/Scripts/python.exe scripts/align_stack.py \
     --dir "D:\pic\DCIM-2026\08-shangduhu-2" --method median \
-    --flat --flat-strength 0.5 --neutralize --star-reduce 1 \
+    --flat --flat-strength 0.5 --neutralize --wb --star-reduce 1 \
     --composite --ground-mask out/ground_mask.png --out out
 ```
 
@@ -247,9 +263,10 @@ Check `out/sky_ground_overlay.jpg`: the boundary is drawn in cyan and should hug
 the foreground; the sky must be free of star trails. The final image is
 `out/merge_final_5994_6012.tif/.jpg`.
 
-> The composite needs a **fixed tripod** and a **static foreground** (the ground
-> layer is the un-registered average). With dedicated foreground frames, use
-> `--ground-dir` (scenario 6).
+> The composite needs a **static foreground**. On a fixed tripod the ground layer
+> is the un-registered average of the frames; on a sky-tracked sequence it uses
+> the **reference frame only**, because the foreground moves with the tracker.
+> With dedicated foreground frames, use `--ground-dir` (scenario 6).
 
 **4. Light-pollution gradient only — compare flat strengths first**
 
@@ -297,9 +314,13 @@ Optional steps are added to the stage list only when their flag is set, and the
 1. **Decode + static-pattern map** — half-resolution grayscale previews are
    decoded for every frame; a high percentile across frames isolates the static
    pattern (hot pixels / fixed pattern), which is subtracted before registration.
+   If the reference frame correlates with the rest of the sequence (sky-tracked
+   rig), the static map is skipped automatically and `--hot-post` is enabled,
+   because the map would otherwise delete the stars (or `--no-static` forces it).
 2. **Register** — ORB features on the enhanced previews, then a star-centroid
-   refinement; the result is a similarity transform per frame. Implausible fits
+   refinement; the result is a projective homography per frame. Implausible fits
    (low score / inliers or high star residual) are rejected; the frame is skipped.
+   Frames are processed in parallel (`--workers`, default one per CPU core).
    With `--hot-pre`, each full-resolution frame is repaired here, before stacking.
 3. **Stack** — sky-aligned frames are combined with a **block-wise median**
    (memmap-backed) or a weighted mean → `stage1_stacked`.
@@ -316,9 +337,12 @@ Optional steps are added to the stage list only when their flag is set, and the
    level → `stageN_stretched`.
 8. **Background neutralization** (`--neutralize`) — per-channel scaling to a
    neutral sky background → `stageN_neutralized`.
-9. **Star reduction** (`--star-reduce`, default `1`) — morphology shrink under a
-   high-pass star mask → `stageN_star_reduced`.
-10. **Deliverables** — every stage is written as `stageN_<name>.tif` +
+9. **White balance** (`--wb`) — automatic star/sky channel gains (whitepatch /
+   grayworld / mixed), blended by `--wb-strength` → `stageN_whitebalanced`;
+   writes `wb_compare.jpg` for a visual decision.
+10. **Star reduction** (`--star-reduce`, default `1`) — morphology shrink under a
+    high-pass star mask → `stageN_star_reduced`.
+11. **Deliverables** — every stage is written as `stageN_<name>.tif` +
     `_preview.jpg` and tiled into `stages_montage.jpg`; the finished image is
     written full-resolution as `merge_final_<start>_<end>.tif` and `.jpg`.
 
@@ -334,9 +358,11 @@ Optional steps are added to the stage list only when their flag is set, and the
 | `merge_final_<start>_<end>.jpg` | **Final image**, JPEG at full resolution. |
 | `stack_<method>.tif` | Linear master after stacking/composite (for external post). |
 | `stack_preview.jpg` | Preview of the linear master. |
-| `transforms.json` | Per-frame similarity transform, inliers, score. |
+| `transforms.json` | Per-frame homography, inliers, score. |
+| `timing.json` | Per-stage timings and worker counts for performance profiling. |
 | `hot_metrics.json`, `hot_compare_pre.jpg`, `hot_compare_post.jpg` | Hot-pixel audit and before/after figures. |
 | `flat_compare.jpg` | No-flat vs flat (and a strength sweep when `--flat-sweep` is used). |
+| `wb_compare.jpg` | Before vs after white balance, labelled with the applied gains. |
 | `ground_stack.tif` + `_preview.jpg` | Static ground layer (with `--composite`). |
 | `sky_mask.png`, `sky_ground_overlay.jpg` | Composite mask and inspection overlay (with `--composite`). |
 | `star_mask.png` | Star mask (when star reduction runs). |
@@ -351,8 +377,9 @@ Optional steps are added to the stage list only when their flag is set, and the
 - **Flat ring.** A full-strength ABE correction of a Milky-Way-filled field can
   carve the centre and leave a bright border ring — lower `--flat-strength` to
   ~0.3–0.6.
-- **Composite requires a static foreground** on a fixed tripod. The ground layer
-  comes from the plain (un-registered) average; a moving foreground will smear.
+- **Composite requires a static foreground.** On a fixed tripod the ground layer
+  comes from the plain (un-registered) average; on a sky-tracked rig it uses the
+  reference frame only, because the foreground moves with the tracker.
 - **Ground-mask polarity.** `--ground-mask` expects a grayscale image where
   **white = ground/foreground** and black = sky. Edges are feathered by
   `--composite-feather`.
@@ -367,11 +394,12 @@ Optional steps are added to the stage list only when their flag is set, and the
 scripts/align_stack.py     command-line front end (argparse only)
 scripts/astro/             implementation, one module per step
   util.py imgio.py         logging/array helpers, CR2 decode / TIFF write
-  registration.py          ORB + star-centroid similarity registration
+  registration.py          ORB + star-centroid homography registration
   stacking.py              mean / block-wise median accumulation
   hotpixels.py             per-channel hot-pixel detection/repair
   flat.py stretch.py       auto flat (ABE), auto MTF stretch
   neutralize.py            background neutralization
+  whitebalance.py          automatic star/sky white balance
   star_reduce.py           star shrink
   composite.py horizon.py  sky/ground stitch + boundary detection
   render.py                per-stage TIFF/JPEG, montage, comparisons

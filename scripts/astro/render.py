@@ -1,5 +1,6 @@
 """Figures and per-stage outputs: TIFF+preview, montage, flat comparison."""
 import os
+from concurrent.futures import ThreadPoolExecutor
 import cv2
 import numpy as np
 
@@ -40,18 +41,42 @@ def write_montage(out_dir, stages, target_bg=0.20, cols=3, scale=0.22, quality=9
     compared at a glance.  `stages` is a sequence of (name, image, linear) and
     linear stages are shown stretched so they are visible next to the already
     stretched ones."""
-    panels = []
-    for name, img, linear in stages:
+    def panel(stage):
+        name, img, linear = stage
         disp = auto_stretch(img, target_bg=target_bg)[0] if linear else img
         p = cv2.resize(to_u8(disp), None, fx=scale, fy=scale,
                        interpolation=cv2.INTER_AREA)
-        panels.append(_label(p, name))
+        return _label(p, name)
+
+    workers = max(1, min(4, len(stages)))
+    if workers > 1:
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            panels = list(ex.map(panel, stages))
+    else:
+        panels = [panel(s) for s in stages]
     while len(panels) % cols:
         panels.append(np.zeros_like(panels[0]))
     rows = [np.hstack(panels[i:i + cols]) for i in range(0, len(panels), cols)]
     grid = np.vstack(rows)
     path = os.path.join(out_dir, "stages_montage.jpg")
     cv2.imwrite(path, cv2.cvtColor(grid, cv2.COLOR_RGB2BGR),
+                [cv2.IMWRITE_JPEG_QUALITY, quality])
+    return path
+
+
+def write_wb_compare(out_dir, before, after, gains, scale=0.30, quality=92):
+    """Before/after white-balance figure for visual review."""
+    def panel(img, text):
+        p = cv2.resize(to_u8(img), None, fx=scale, fy=scale,
+                       interpolation=cv2.INTER_AREA)
+        return _label(p, text)
+    g = np.asarray(gains, np.float64)
+    row = np.hstack([
+        panel(before, "before WB"),
+        panel(after, "after WB  gains %.3f/%.3f/%.3f" % tuple(g)),
+    ])
+    path = os.path.join(out_dir, "wb_compare.jpg")
+    cv2.imwrite(path, cv2.cvtColor(row, cv2.COLOR_RGB2BGR),
                 [cv2.IMWRITE_JPEG_QUALITY, quality])
     return path
 
@@ -66,14 +91,23 @@ def write_flat_compare(stack_lin, flat_lin, target_bg, neutralize, out_dir,
     sweep the second panel shows the strength actually applied."""
     def blend(s):
         return np.clip(stack_lin + s * (flat_lin - stack_lin), 0, 1)
-    panels = [("no flat", _product_preview(stack_lin, target_bg, neutralize, scale))]
-    for s in sweep:
-        panels.append(("flat s=%.2f" % s,
-                       _product_preview(blend(s), target_bg, neutralize, scale)))
+
+    specs = [("no flat", stack_lin)]
+    specs += [("flat s=%.2f" % s, blend(s)) for s in sweep]
     if not sweep:
-        panels.append(("flat s=%.1f" % applied,
-                       _product_preview(blend(applied), target_bg, neutralize, scale)))
-    row = np.hstack([_label(im, t) for t, im in panels])
+        specs.append(("flat s=%.1f" % applied, blend(applied)))
+
+    def panel(spec):
+        title, img = spec
+        return _label(_product_preview(img, target_bg, neutralize, scale), title)
+
+    workers = max(1, min(4, len(specs)))
+    if workers > 1:
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            panels = list(ex.map(panel, specs))
+    else:
+        panels = [panel(s) for s in specs]
+    row = np.hstack(panels)
     path = os.path.join(out_dir, "flat_compare.jpg")
     cv2.imwrite(path, cv2.cvtColor(row, cv2.COLOR_RGB2BGR),
                 [cv2.IMWRITE_JPEG_QUALITY, 90])

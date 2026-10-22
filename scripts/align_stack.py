@@ -8,19 +8,20 @@ The pipeline is split into single-purpose modules under ``scripts/astro/``;
 this file is only the command-line front end.  See ``astro/pipeline.py`` for the
 orchestration and the module docstrings for the individual steps:
 
-    registration  ORB + star-centroid similarity registration (align the sky)
+    registration  ORB + star-centroid homography registration (align the sky)
     stacking      weighted mean / block-wise median accumulation
     hotpixels     single-frame, per-channel colored hot-pixel detection/repair
     flat          auto flat (PixInsight ABE style) background-gradient removal
     stretch       adaptive (auto MTF) brightness stretch
     neutralize    per-channel sky-background neutralization
+    whitebalance  automatic star-colour / gray-world white balance
     star_reduce   star-mask morphology star shrink
     composite     sky/ground ("天地") stitch at the detected horizon
     render        per-stage TIFF/JPEG, montage and comparison figures
 
 Stages (each enabled step adds one; the stretch is always applied):
     stacked -> (hotfix) -> (composite) -> (flat) -> stretched -> (neutralized)
-        -> (star_reduced)
+        -> (whitebalanced) -> (star_reduced)
 
 Every stage is written as ``stage<i>_<name>.tif`` + ``_preview.jpg`` and tiled
 into ``stages_montage.jpg``; the finished image is written as a full-resolution
@@ -30,7 +31,7 @@ Usage (Windows, using the repo's virtualenv):
     .venv/Scripts/python.exe scripts/align_stack.py \
         --dir "D:\\pic\\DCIM-2026\\08-shangduhu-2" \
         --start 5994 --end 6012 --out out --ref 6003 --method median \
-        --composite --flat --flat-strength 0.5 --neutralize
+        --composite --flat --flat-strength 0.5 --neutralize --wb
 """
 import argparse
 
@@ -56,16 +57,50 @@ def build_parser():
                          "rejects it as an outlier. 'mean' is kept only for "
                          "special cases and is discouraged")
     ap.add_argument("--exclude", default="", help="comma separated frame numbers to drop")
+    ap.add_argument("--workers", type=int, default=0, metavar="N",
+                    help="parallel worker threads for per-frame registration "
+                         "(default 0 = one per frame up to the CPU count)")
+    ap.add_argument("--io-workers", type=int, default=0, metavar="N",
+                    help="parallel CR2 decode workers for previews and the "
+                         "full-res stacking pass (default 0 = 8, bounded so "
+                         "only ~2*N decoded frames are held in RAM)")
+    ap.add_argument("--stack-workers", type=int, default=0, metavar="N",
+                    help="parallel row-band workers for the median stack "
+                         "(default 0 = 8; each band is sized to ~1 GB; the "
+                         "NaN-aware border path needs a temporary copy, so "
+                         "budget ~2-3xN GB)")
+    ap.add_argument("--render-workers", type=int, default=0, metavar="N",
+                    help="parallel workers for per-stage TIFF/JPEG writing "
+                         "(default 0 = 4)")
+    ap.add_argument("--no-static", action="store_true",
+                    help="disable static-pattern subtraction (automatic for "
+                         "sky-tracked sequences, where a percentile map would "
+                         "remove the stars themselves)")
     ap.add_argument("--stretch-bg", type=float, default=0.20,
                     help="target sky background level of the stretched output "
                          "(higher = brighter; default 0.20)")
     ap.add_argument("--neutralize", action="store_true",
-                    help="neutralize the sky background to a grey before "
+                    help="neutralize the sky background to a grey after "
                          "stretching (PixInsight BackgroundNeutralization style)")
     ap.add_argument("--star-reduce", type=float, default=1.0, metavar="PX",
                     help="shrink stars by PX pixels with a morphology + star-mask "
                          "step applied to the stretched image (PixInsight "
                          "StarReduction style); default 1 (gentle), 0 disables")
+
+    w = ap.add_argument_group("white balance (after neutralization)")
+    w.add_argument("--wb", action="store_true",
+                   help="apply an automatic white balance after background "
+                        "neutralization; writes wb_compare.jpg for visual review")
+    w.add_argument("--wb-mode", choices=["whitepatch", "grayworld", "mixed"],
+                   default="whitepatch",
+                   help="whitepatch = brightest sky pixels (default), grayworld "
+                        "= whole-sky channel means, mixed = geometric mean")
+    w.add_argument("--wb-strength", type=float, default=0.6, metavar="S",
+                   help="blend the correction in log space: 0 off, 1 full "
+                        "(default 0.6)")
+    w.add_argument("--wb-gains", default="", metavar="R,G,B",
+                   help="manual gains (overrides the automatic measurement), "
+                        "e.g. 1.02,0.99,0.99")
 
     g = ap.add_argument_group("flat (auto background / ABE)")
     g.add_argument("--flat", action="store_true",

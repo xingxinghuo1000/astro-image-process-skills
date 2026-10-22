@@ -5,11 +5,12 @@ The package splits the pipeline into single-purpose modules so
 
     util          logging + small array helpers
     imgio         CR2 decoding and TIFF writing
-    registration  ORB + star-centroid similarity registration
+    registration  ORB + star-centroid homography registration
     stacking      mean / median frame accumulation
     flat          auto flat (PixInsight ABE style) background-gradient removal
     stretch       adaptive (auto MTF) brightness stretch
     neutralize    per-channel sky-background neutralization
+    whitebalance  automatic star/sky white balance
     star_reduce   star-mask morphology star shrink
     composite     sky/ground ("天地") stitch at the detected horizon
     render        per-stage TIFF/JPEG, montage and comparison figures

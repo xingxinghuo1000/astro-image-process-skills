@@ -17,26 +17,44 @@ not).  Repair replaces the flagged channel-pixel with that channel's local
 median, leaving every other pixel untouched.
 """
 import os
+from concurrent.futures import ThreadPoolExecutor
 import cv2
 import numpy as np
 
 from .stretch import stretch_preview
 from .render import _label
 
+_NEIGH_KERNEL = np.ones((3, 3), np.uint8)
+_NEIGH_KERNEL[1, 1] = 0
+
 
 def _neighbor_max(a):
-    """Max of the 8 neighbours of every pixel (edge wrap is negligible)."""
-    m = np.full_like(a, -1.0)
-    for dy in (-1, 0, 1):
-        for dx in (-1, 0, 1):
-            if dy == 0 and dx == 0:
-                continue
-            m = np.maximum(m, np.roll(np.roll(a, dy, 0), dx, 1))
-    return m
+    """Max of the 8 neighbours of every pixel (excludes the centre)."""
+    return cv2.dilate(a.astype(np.float32), _NEIGH_KERNEL)
+
+
+def _residuals(rgb, ksize, workers=3):
+    """Per-channel ``channel - medianBlur(channel)``, three channels in parallel."""
+    h, w = rgb.shape[:2]
+    resid = np.empty((h, w, 3), np.float32)
+
+    def one(c):
+        ch = rgb[..., c].astype(np.float32)
+        return c, ch - cv2.medianBlur(ch, ksize)
+
+    workers = max(1, min(int(workers), 3))
+    if workers == 1:
+        for c in range(3):
+            resid[..., c] = one(c)[1]
+    else:
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            for c, r in ex.map(one, range(3)):
+                resid[..., c] = r
+    return resid
 
 
 def hot_pixel_flags(rgb, sigma=6.0, ksize=5, thr_abs=0.0, color_ratio=2.0,
-                    neigh_ratio=1.0):
+                    neigh_ratio=1.0, workers=3):
     """Per-channel bool map of the *peak* pixel of each colored hot pixel.
 
     `sigma` is the robust (MAD) threshold multiplier, `thr_abs` an absolute
@@ -46,27 +64,35 @@ def hot_pixel_flags(rgb, sigma=6.0, ksize=5, thr_abs=0.0, color_ratio=2.0,
     over several px after demosaic, so this flags only the peak; `repair`
     expands each peak over the rest of the (colored, elevated) blob."""
     h, w = rgb.shape[:2]
-    resid = np.empty((h, w, 3), np.float32)
-    for c in range(3):
-        ch = rgb[..., c].astype(np.float32)
-        resid[..., c] = ch - cv2.medianBlur(ch, ksize)
+    resid = _residuals(rgb, ksize, workers)
     flags = np.zeros((h, w, 3), bool)
-    for c in range(3):
+
+    def one(c):
         r = resid[..., c]
         med = float(np.median(r))
         mad = float(np.median(np.abs(r - med))) * 1.4826 + 1e-9
         thr = max(med + sigma * mad, med + thr_abs)
         cand = r > thr
-        if not cand.any():
-            continue
-        cand &= r > neigh_ratio * np.maximum(_neighbor_max(r), 0.0)
-        others = np.delete(resid, c, axis=2).max(axis=2)
-        cand &= r > color_ratio * np.maximum(others, 0.0)
-        flags[..., c] = cand
+        if cand.any():
+            cand &= r > neigh_ratio * np.maximum(_neighbor_max(r), 0.0)
+            others = np.maximum(resid[..., (c + 1) % 3],
+                                resid[..., (c + 2) % 3])
+            cand &= r > color_ratio * np.maximum(others, 0.0)
+        return c, cand
+
+    workers = max(1, min(int(workers), 3))
+    if workers == 1:
+        for c in range(3):
+            flags[..., c] = one(c)[1]
+    else:
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            for c, cand in ex.map(one, range(3)):
+                flags[..., c] = cand
     return flags
 
 
-def apply_hot_pixels(rgb, flags, grow=3, thr_low=0.03, color_ratio=2.0):
+def apply_hot_pixels(rgb, flags, grow=3, thr_low=0.03, color_ratio=2.0,
+                     workers=3):
     """Cosmetic repair of the flagged hot pixels.
 
     A single flagged peak is only one pixel of a multi-pixel demosaic blob, so
@@ -78,38 +104,51 @@ def apply_hot_pixels(rgb, flags, grow=3, thr_low=0.03, color_ratio=2.0):
 
     Returns (repaired_rgb, replaced_channel_px)."""
     out = rgb.copy()
-    resid = np.empty_like(rgb, dtype=np.float32)
-    for c in range(3):
-        resid[..., c] = rgb[..., c].astype(np.float32) - \
-            cv2.medianBlur(rgb[..., c].astype(np.float32), 5)
+    resid = _residuals(rgb, 5, workers)
     rect = cv2.getStructuringElement(cv2.MORPH_RECT, (2 * grow + 1,) * 2)
-    n = 0
-    for c in range(3):
+
+    def one(c):
         ch = rgb[..., c].astype(np.float32)
         bg1 = cv2.medianBlur(ch, 5)
         bg = cv2.medianBlur(bg1, 5)
-        others = np.delete(resid, c, axis=2).max(axis=2)
+        others = np.maximum(resid[..., (c + 1) % 3],
+                            resid[..., (c + 2) % 3])
         grown = cv2.dilate(flags[..., c].astype(np.uint8), rect) > 0
         mask = grown & (resid[..., c] > thr_low) & \
             (resid[..., c] > color_ratio * np.maximum(others, 0.0))
-        out[..., c][mask] = bg[mask]
-        n += int(mask.sum())
+        return c, bg, mask, int(mask.sum())
+
+    n = 0
+    workers = max(1, min(int(workers), 3))
+    if workers == 1:
+        results = (one(c) for c in range(3))
+    else:
+        ex = ThreadPoolExecutor(max_workers=workers)
+        results = ex.map(one, range(3))
+    try:
+        for c, bg, mask, count in results:
+            out[..., c][mask] = bg[mask]
+            n += count
+    finally:
+        if workers > 1:
+            ex.shutdown()
     return np.clip(out, 0, 1), n
 
 
 def detect_and_fix(rgb, sigma=6.0, ksize=5, thr_abs=0.0, color_ratio=2.0,
-                   neigh_ratio=1.0, grow=3):
+                   neigh_ratio=1.0, grow=3, workers=3):
     """Convenience wrapper: return (repaired_rgb, replaced_channel_px)."""
     flags = hot_pixel_flags(rgb, sigma, ksize, thr_abs, color_ratio,
-                            neigh_ratio)
-    return apply_hot_pixels(rgb, flags, grow=grow, color_ratio=color_ratio)
+                            neigh_ratio, workers)
+    return apply_hot_pixels(rgb, flags, grow=grow, color_ratio=color_ratio,
+                            workers=workers)
 
 
 def metrics(rgb, sigma=6.0, ksize=5, thr_abs=0.0, color_ratio=2.0,
-            neigh_ratio=1.0):
+            neigh_ratio=1.0, workers=3):
     """Audit of a linear image: flagged peaks and distinct hot pixels."""
     flags = hot_pixel_flags(rgb, sigma, ksize, thr_abs, color_ratio,
-                            neigh_ratio)
+                            neigh_ratio, workers)
     return dict(hot_channel_px=int(flags.sum()),
                 hot_pixels=int(flags.reshape(-1, 3).any(1).sum()))
 
@@ -121,9 +160,7 @@ def write_compare(out_dir, before, after, tag, sigma=6.0, ksize=5,
     the strongest colored hot pixels, so the effect can be judged by eye."""
     flags = hot_pixel_flags(before, sigma, ksize, thr_abs, color_ratio,
                             neigh_ratio)
-    resid = np.stack([before[..., c].astype(np.float32)
-                      - cv2.medianBlur(before[..., c].astype(np.float32), ksize)
-                      for c in range(3)], 2)
+    resid = _residuals(before, ksize)
     score = np.where(flags, resid, 0).max(2)
     ys, xs = np.where(flags.any(2))
     picked = []

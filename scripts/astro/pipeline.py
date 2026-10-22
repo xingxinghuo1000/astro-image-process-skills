@@ -1,8 +1,9 @@
 """Pipeline orchestration: wire the individual steps together.
 
-    decode previews -> static-pattern map -> register -> stack
+    decode previews -> (static-pattern map) -> register -> stack
         -> (optional) sky/ground composite -> (optional) flat
-        -> stretch -> (optional) neutralize -> (optional) star reduction
+        -> stretch -> (optional) neutralize -> (optional) white balance
+        -> (optional) star reduction
         -> per-stage TIFFs + montage -> final TIFF + JPEG
 
 The step implementations live in the sibling modules; this file only sequences
@@ -11,6 +12,7 @@ them and writes the deliverables.
 import os
 import json
 import time
+from concurrent.futures import ThreadPoolExecutor
 import numpy as np
 import cv2
 
@@ -21,11 +23,48 @@ from . import stacking
 from . import flat as flatmod
 from . import stretch
 from . import neutralize
+from . import whitebalance
 from . import star_reduce
 from . import composite as composite_step
 from . import horizon
 from . import render
 from . import hotpixels
+
+
+def _register_task(task):
+    """Per-frame registration work, safe to run in a thread pool."""
+    (k, idx, clean, ref_id, ref_enh, ref_kp, ref_desc, ref_stars, reg_mask,
+     gw, gh, reg_scale) = task
+    eye = np.eye(3, dtype=np.float32)
+    if idx == ref_id:
+        rot, tx, ty, scale, _ = reg.homography_metrics(eye, gw * 2, gh * 2)
+        return dict(k=k, idx=idx, ok=True, reason="", M_half=eye, M_full=eye,
+                    gd=0, inl=0, sc=1.0, resid_med=0.0, resid_frac=1.0,
+                    rot=rot, tx=tx, ty=ty, scale=scale)
+    hpf = reg.highpass_float(clean)
+    enh = reg.enhance_for_registration(clean)
+    orb = reg.make_detector()
+    kp, desc = orb.detectAndCompute(enh, reg_mask)
+    M_half, gd, minl = reg.register(ref_desc, ref_kp, desc, kp)
+    if M_half is None:
+        return dict(k=k, idx=idx, ok=False,
+                    reason=f"FAILED to register (good={gd}, inliers={minl})",
+                    gd=gd, inl=minl)
+    mov_stars = reg.detect_stars(hpf, valid=reg_mask)
+    M_half = reg.refine_transform(M_half, ref_stars, mov_stars)
+    M_full = reg.scale_matrix(M_half, 1.0 / reg_scale)
+    sc = reg.star_score(ref_enh, enh, M_half)
+    resid_med, resid_frac = reg.star_residual(ref_stars, mov_stars, M_half)
+    ok = reg.transform_is_plausible(M_half, gw, gh, minl, sc,
+                                    resid_med, resid_frac)
+    rot, tx, ty, scale, _ = reg.homography_metrics(M_full, gw * 2, gh * 2)
+    return dict(k=k, idx=idx, ok=ok,
+                reason=(f"registration rejected (score={sc:.2f} inl={minl} "
+                        f"resid={resid_med:.2f}px frac={resid_frac:.2f})"
+                        if not ok else ""),
+                M_half=M_half, M_full=M_full, gd=gd, inl=minl, sc=sc,
+                resid_med=resid_med, resid_frac=resid_frac,
+                rot=rot, tx=tx, ty=ty, scale=scale)
 
 
 def _stack_ground_from_dir(args):
@@ -68,31 +107,103 @@ def run(args):
     ref_id = args.ref if args.ref in ids else ids[len(ids) // 2]
     log(f"reference frame: IMG_{ref_id}")
 
-    orb = reg.make_detector()
-    t0 = time.time()
+    t0 = time.perf_counter()
+    timings = {}
+
+    def mark(name, started):
+        timings[name] = round(time.perf_counter() - started, 3)
+
+    io_workers = args.io_workers if args.io_workers > 0 else min(
+        8, os.cpu_count() or 1)
+    io_workers = max(1, min(io_workers, len(files)))
+
+    ground_mask_img = None
+    if args.ground_mask:
+        ground_mask_img = cv2.imread(args.ground_mask, cv2.IMREAD_GRAYSCALE)
+        if ground_mask_img is None:
+            log(f"  !! cannot read --ground-mask {args.ground_mask}")
 
     # ---- pass 1: build a static-pattern map (hot pixels / fixed pattern) ----
-    # A pixel that is bright in *most* frames is a hot pixel (static), while a
-    # real star is bright in only a frame or two because the sky moves.  A high
-    # percentile across frames therefore isolates the static pattern, which we
-    # subtract so ORB can only latch onto real moving stars.
-    log("pass 1: decoding grayscale previews to remove static pattern ...")
-    grays = [imgio.load_gray8(path) for _, path in files]
+    # On a fixed tripod a pixel that is bright in most frames is a hot pixel or
+    # fixed pattern; a real star is bright in only a frame or two because the
+    # sky moves.  A high percentile across frames isolates that static pattern.
+    # On a *sky-tracked* sequence the stars themselves are static, so the same
+    # percentile map contains the whole star field and subtracting it erases
+    # the very features ORB needs.  Detect the tracked case first.
+    log(f"pass 1: decoding grayscale previews ({io_workers} workers) ...")
+    t = time.perf_counter()
+    if io_workers > 1:
+        with ThreadPoolExecutor(max_workers=io_workers) as ex:
+            grays = list(ex.map(imgio.load_gray8, [p for _, p in files]))
+    else:
+        grays = [imgio.load_gray8(path) for _, path in files]
+    mark("decode_previews", t)
     gh, gw = grays[0].shape
-    static = reg.build_static_map(grays)
-    cleaned = [np.clip(g - static, 0, None) for g in grays]
+    t = time.perf_counter()
+
+    reg_mask = None
+    if ground_mask_img is not None:
+        sky_half = cv2.resize((ground_mask_img < 127).astype(np.uint8),
+                              (gw, gh), interpolation=cv2.INTER_NEAREST)
+        reg_mask = cv2.erode(sky_half, np.ones((5, 5), np.uint8))
+        log(f"  registration restricted to sky ({100.0 * reg_mask.mean():.1f}% "
+            f"of the half-res frame)")
+
+    k_ref = [i for i, (idx, _) in enumerate(files) if idx == ref_id][0]
+    tracked = False
+    if len(grays) >= 5:
+        a = reg.highpass_float(grays[k_ref])
+        sl = slice(0, int(gh * 0.55))
+        probes = sorted({len(grays) // 4, len(grays) // 2,
+                         3 * len(grays) // 4, len(grays) - 1})
+        corrs = []
+        for k in probes:
+            if k == k_ref:
+                continue
+            b = reg.highpass_float(grays[k])
+            if reg_mask is not None:
+                m = reg_mask[sl] > 0
+                aa, bb = a[sl][m], b[sl][m]
+            else:
+                aa, bb = a[sl].ravel(), b[sl].ravel()
+            aa = aa - aa.mean()
+            bb = bb - bb.mean()
+            corrs.append(float((aa * bb).sum() /
+                               (np.linalg.norm(aa) * np.linalg.norm(bb) + 1e-9)))
+        corr = float(np.median(corrs)) if corrs else 0.0
+        if corr > 0.65:
+            tracked = True
+            log(f"  sky is nearly static around the reference frame "
+                f"(high-pass corr={corr:.2f}): treating as tracked; "
+                f"static-pattern subtraction disabled")
+    if not args.no_static and not tracked:
+        static = reg.build_static_map(grays)
+        cleaned = [np.clip(g - static, 0, None) for g in grays]
+        log(f"  static-pattern map built (half-res {gh}x{gw}, {len(files)} frames)")
+    else:
+        cleaned = grays
+        log("  static-pattern subtraction disabled")
     del grays
-    log(f"  static-pattern map built (half-res {gh}x{gw}, {len(files)} frames)")
+    if tracked and not args.hot_post:
+        args.hot_post = True
+        log("  tracked sequence: enabling --hot-post (fixed sensor hot pixels "
+            "are not rejected by a median of static stars)")
+    mark("tracked_and_static", t)
 
     reg_scale = 0.5
     H, W = gh * 2, gw * 2
-    k_ref = [i for i, (idx, _) in enumerate(files) if idx == ref_id][0]
 
+    t = time.perf_counter()
+    orb = reg.make_detector()
     ref_clean = cleaned[k_ref]
     ref_enh = reg.enhance_for_registration(ref_clean)
-    ref_kp, ref_desc = orb.detectAndCompute(ref_enh, None)
-    ref_stars = reg.detect_stars(reg.highpass_float(ref_clean))
+    ref_kp, ref_desc = orb.detectAndCompute(ref_enh, reg_mask)
+    ref_stars = reg.detect_stars(reg.highpass_float(ref_clean), valid=reg_mask)
     log(f"  reference ORB features: {len(ref_kp)}  stars: {len(ref_stars)}")
+    mark("reference", t)
+    if not ref_kp:
+        log("  !! reference frame has no ORB features; aborting")
+        return
 
     acc_sum = None
     acc_w = np.zeros((H, W), np.float32)
@@ -112,41 +223,68 @@ def run(args):
     # median needs all aligned frames kept (memory heavy) -> use memmap on disk
     median_store = None
     mm_path = None
+    kept = 0
     if args.method == "median":
         mm_path = os.path.join(args.out, "_aligned_uint16.dat")
         median_store = stacking.make_median_store(mm_path, len(files), H, W)
 
-    log("pass 2: registering + stacking ...")
+    workers = args.workers if args.workers > 0 else min(len(files),
+                                                       os.cpu_count() or 1)
+    workers = max(1, min(workers, len(files)))
+    stack_workers = 1
+    log(f"pass 2: registering {len(files)} frames with {workers} worker threads ...")
+    t = time.perf_counter()
+    tasks = [(k, idx, cleaned[k], ref_id, ref_enh, ref_kp, ref_desc,
+              ref_stars, reg_mask, gw, gh, reg_scale)
+             for k, (idx, _) in enumerate(files)]
+    prev_threads = cv2.getNumThreads()
+    if workers > 1:
+        cv2.setNumThreads(1)
+    try:
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            reg_results = list(ex.map(_register_task, tasks))
+    finally:
+        cv2.setNumThreads(prev_threads)
+    mark("registration", t)
+
+    io_pool = (ThreadPoolExecutor(max_workers=io_workers)
+               if io_workers > 1 else None)
+    pending = {}
+    next_submit = 0
+    io_limit = max(1, io_workers * 2)
+
+    def submit_frames():
+        nonlocal next_submit
+        if io_pool is None:
+            return
+        while next_submit < len(files) and len(pending) < io_limit:
+            pending[next_submit] = io_pool.submit(
+                imgio.load_linear, files[next_submit][1])
+            next_submit += 1
+
+    def take_frame(k):
+        if io_pool is None:
+            return imgio.load_linear(files[k][1])
+        return pending.pop(k).result()
+
+    submit_frames()
+    t = time.perf_counter()
+
     for k, (idx, path) in enumerate(files):
         ts = time.time()
         clean = cleaned[k]
-        if idx == ref_id:
-            M_half = np.array([[1, 0, 0], [0, 1, 0]], np.float32)
-            M_full = M_half.copy()
-            enh = ref_enh
-            minl = gd = 0
-        else:
-            hpf = reg.highpass_float(clean)
-            enh = reg.enhance_for_registration(clean)
-            kp, desc = orb.detectAndCompute(enh, None)
-            M_half, gd, minl = reg.register(ref_desc, ref_kp, desc, kp)
-            if M_half is None:
-                log(f"  IMG_{idx}: FAILED to register (good={gd}, inliers={minl}); skipped")
-                continue
-            mov_stars = reg.detect_stars(hpf)
-            M_half = reg.refine_transform(M_half, ref_stars, mov_stars)
-            M_full = reg.scale_matrix(M_half, 1.0 / reg_scale)
-
-        sc = reg.star_score(ref_enh, enh, M_half)
-        resid_med, resid_frac = (0.0, 1.0) if idx == ref_id else \
-            reg.star_residual(ref_stars, reg.detect_stars(reg.highpass_float(clean)),
-                              M_half)
-        if idx != ref_id and not reg.transform_is_plausible(M_half, gw, gh, minl,
-                                                            sc, resid_med, resid_frac):
-            log(f"  !! IMG_{idx}: registration rejected "
-                f"(score={sc:.2f} inl={minl} resid={resid_med:.2f}px "
-                f"frac={resid_frac:.2f}); frame excluded from stack")
+        r = reg_results[k]
+        if not r["ok"]:
+            if io_pool is not None:
+                fut = pending.pop(k, None)
+                if fut is not None:
+                    fut.cancel()
+                submit_frames()
+            log(f"  !! IMG_{idx}: {r['reason']}; frame excluded from stack")
             continue
+        M_half = r["M_half"]
+        M_full = r["M_full"]
+        gd, minl, sc = r["gd"], r["inl"], r["sc"]
 
         if ground_acc is not None:
             if var_sum is None:
@@ -156,7 +294,8 @@ def run(args):
             var_sq += clean * clean
             var_n += 1
 
-        lin = imgio.load_linear(path)
+        lin = take_frame(k)
+        submit_frames()
         if acc_sum is None:
             acc_sum = np.zeros_like(lin)
 
@@ -178,9 +317,10 @@ def run(args):
             acc_w += w
         else:
             warped = lin if idx == ref_id else stacking.warp_into(lin, M_full, W, H)
-            median_store[k] = np.clip(warped * 65535.0, 0, 65535).astype(np.uint16)
+            median_store[kept] = np.clip(warped * 65535.0, 0, 65535).astype(np.uint16)
+            kept += 1
 
-        if ground_acc is not None:
+        if ground_acc is not None and (not tracked or idx == ref_id):
             ground_acc += lin
             ground_n += 1
 
@@ -188,23 +328,36 @@ def run(args):
             imgio.write_tiff16(os.path.join(frames_dir, f"IMG_{idx}.tif"),
                                np.clip(warped * 65535.0, 0, 65535).astype(np.uint16))
 
-        rot = np.degrees(np.arctan2(M_full[1, 0], M_full[0, 0]))
-        tx, ty = M_full[0, 2], M_full[1, 2]
+        rot, tx, ty, scale = r["rot"], r["tx"], r["ty"], r["scale"]
         log(f"  IMG_{idx}: good={gd} inliers={minl} score={sc:.3f} rot={rot:+.3f}deg "
-            f"shift=({tx:+.2f},{ty:+.2f})px  [{time.time()-ts:.1f}s]")
+            f"shift=({tx:+.2f},{ty:+.2f})px scale={scale:.5f}  "
+            f"[{time.time()-ts:.1f}s]")
         records.append(dict(frame=idx, good=int(gd), inliers=int(minl),
                             score=float(sc), rot_deg=float(rot),
                             tx=float(tx), ty=float(ty),
                             M=[[float(v) for v in row] for row in M_full]))
         del lin
 
+    if io_pool is not None:
+        io_pool.shutdown(wait=True)
+    mark("frame_loop", t)
+
     # ---- stack ----
     log("stacking ...")
+    t = time.perf_counter()
     if args.method == "mean":
         stack = stacking.mean_stack(acc_sum, acc_w)
     else:
-        log(f"  computing median over {len(files)} frames (block-wise) ...")
-        stack = stacking.median_stack(median_store, H, W)
+        if kept == 0:
+            log("  no frames registered; nothing to stack")
+            return
+        stack_workers = args.stack_workers if args.stack_workers > 0 else min(
+            8, os.cpu_count() or 1)
+        log(f"  computing median over {kept} accepted frames "
+            f"({stack_workers} row-band workers) ...")
+        stack = stacking.median_stack(median_store[:kept], H, W,
+                                      workers=stack_workers)
+    mark("stacking", t)
 
     # ---- staged post-processing ----
     stages = []
@@ -217,6 +370,7 @@ def run(args):
 
     # ---- optional hot-pixel removal on the stacked image (single frame) ---------
     if args.hot_post:
+        t = time.perf_counter()
         pre_hot = master.copy()
         master, nh = hotpixels.detect_and_fix(
             master, args.hot_sigma, args.hot_ksize, args.hot_abs,
@@ -227,11 +381,14 @@ def run(args):
             args.out, pre_hot, master, "post", args.hot_sigma, args.hot_ksize,
             args.hot_abs, args.hot_color, args.hot_neigh)
         log(f"  wrote {p}  (before vs after post-stacking hot-pixel removal)")
+        mark("hotfix", t)
 
     # ---- optional sky/ground composite -----------------------------------------
     # Stitch the star-aligned sky onto a static ground layer (the plain average of
     # the frames), splitting them at the detected sky-ground boundary.  This
     # replaces the linear master that every later step operates on.
+    sky_mask = None
+    t = time.perf_counter()
     if args.composite:
         if args.ground_dir:
             ground = _stack_ground_from_dir(args)
@@ -252,7 +409,7 @@ def run(args):
         # ground mask (white = ground); it overrides the variance detection.
         sky_mask = None
         if args.ground_mask:
-            gm = cv2.imread(args.ground_mask, cv2.IMREAD_GRAYSCALE)
+            gm = ground_mask_img
             if gm is None:
                 log(f"  !! composite: cannot read --ground-mask "
                     f"{args.ground_mask}; falling back to auto detection")
@@ -274,11 +431,13 @@ def run(args):
         linear = master
     else:
         linear = master
+    mark("composite", t)
 
     # stage: auto flat (ABE) -- fit and subtract the smooth per-channel
     # background gradient on the LINEAR image, where gradients are additive,
     # i.e. before the nonlinear stretch.
     if args.flat:
+        t_flat = time.perf_counter()
         flat_full, finfo = flatmod.auto_flat(linear, bins=args.flat_bins,
                                              degree=args.flat_degree,
                                              pct=args.flat_pct, mode=args.flat_mode)
@@ -288,27 +447,62 @@ def run(args):
             + ", ".join("ch%d=%.4f..%.4f" % (c, mn, mx)
                         for c, (mn, mx, _) in enumerate(finfo)))
         add_stage("flat", linear, linear=True)
+        mark("flat_model", t_flat)
+        t_cmp = time.perf_counter()
         sweep = [float(x) for x in args.flat_sweep.split(",") if x.strip()]
         cmp_path = render.write_flat_compare(master, flat_full, args.stretch_bg,
                                              args.neutralize, args.out, sweep,
                                              applied=args.flat_strength)
+        mark("flat_compare", t_cmp)
         log(f"  wrote {cmp_path}  (no flat vs auto flat"
             + ("" if not sweep else " vs strength sweep " + args.flat_sweep) + ")")
 
     # stage: adaptive brightness stretch (auto MTF), so faint structure shows
+    t = time.perf_counter()
     ys, mtf_m, bg = stretch.auto_stretch(linear, target_bg=args.stretch_bg)
     add_stage("stretched", ys)
+    mark("stretch", t)
 
     # stage: background neutralization -- scale each channel so the sky
     # background becomes a neutral grey (PixInsight BackgroundNeutralization).
     if args.neutralize:
+        t = time.perf_counter()
         ys, sref, sgain = neutralize.background_neutralize(ys)
         log(f"  neutralized background: ref={np.round(sref, 4).tolist()} "
             f"gains={np.round(sgain, 4).tolist()}")
         add_stage("neutralized", ys)
+        mark("neutralize", t)
+
+    # stage: automatic white balance -- the neutralization equalizes the sky
+    # background, this corrects the star/Milky-Way colour balance.  The
+    # before/after figure is for visual review (and a manual --wb-gains retry).
+    if args.wb:
+        t = time.perf_counter()
+        manual = None
+        if args.wb_gains.strip():
+            try:
+                manual = np.array([float(v) for v in args.wb_gains.split(",")],
+                                  np.float64)
+                if manual.size != 3:
+                    raise ValueError
+            except ValueError:
+                log(f"  !! invalid --wb-gains '{args.wb_gains}'; using auto")
+                manual = None
+        before = ys.copy()
+        ys, wgains = whitebalance.auto_white_balance(
+            ys, mode=args.wb_mode, strength=args.wb_strength, gains=manual,
+            sky_mask=sky_mask)
+        log(f"  white balance ({args.wb_mode}, strength={args.wb_strength:g}): "
+            f"gains={np.round(wgains, 4).tolist()}")
+        add_stage("whitebalanced", ys)
+        p = render.write_wb_compare(args.out, before, ys, wgains)
+        log(f"  wrote {p}  (before vs after white balance)")
+        del before
+        mark("white_balance", t)
 
     # stage: star reduction -- shrink stars under a high-pass star mask.
     if args.star_reduce > 0:
+        t = time.perf_counter()
         ys, star_mask = star_reduce.reduce_stars(ys, amount=args.star_reduce)
         cv2.imwrite(os.path.join(args.out, "star_mask.png"),
                     cv2.cvtColor((np.clip(star_mask, 0, 1) * 255).astype(np.uint8),
@@ -316,12 +510,25 @@ def run(args):
         log(f"  stars reduced by {args.star_reduce:g}px "
             f"(mask {100.0 * (star_mask > 0.05).mean():.2f}% of frame)")
         add_stage("star_reduced", ys)
+        mark("star_reduce", t)
 
     # ---- every stage as its own TIFF + preview, plus a comparison montage ----
     log("  writing per-stage images ...")
-    for name, img, _ in stages:
-        render.write_stage(args.out, name, img)
+    t = time.perf_counter()
+    render_workers = args.render_workers if args.render_workers > 0 else min(
+        4, os.cpu_count() or 1)
+    render_workers = max(1, min(render_workers, len(stages)))
+    if render_workers > 1:
+        with ThreadPoolExecutor(max_workers=render_workers) as ex:
+            list(ex.map(lambda item: render.write_stage(args.out, item[0],
+                                                        item[1]), stages))
+    else:
+        for name, img, _ in stages:
+            render.write_stage(args.out, name, img)
+    mark("stage_writes", t)
+    t = time.perf_counter()
     montage = render.write_montage(args.out, stages, target_bg=args.stretch_bg)
+    mark("montage", t)
     log(f"  wrote {montage}  (all stages side by side)")
 
     # ---- hot-pixel comparison products + audit ----
@@ -334,8 +541,10 @@ def run(args):
         log(f"  wrote {p}  (before vs after pre-stacking hot-pixel removal)")
         del hot_pre_before, hot_pre_after
 
+    t = time.perf_counter()
     met = hotpixels.metrics(linear, args.hot_sigma, args.hot_ksize,
                             args.hot_abs, args.hot_color, args.hot_neigh)
+    mark("hot_metrics", t)
     log("  hot-pixel audit on the linear master: %d hot pixels (%d channel-px)"
         % (met["hot_pixels"], met["hot_channel_px"]))
     with open(os.path.join(args.out, "hot_metrics.json"), "w") as f:
@@ -348,6 +557,7 @@ def run(args):
     # of the merged sequence); every intermediate is a stageN_* file.
     first_id, last_id = files[0][0], files[-1][0]
     final_base = f"merge_final_{first_id}_{last_id}"
+    t = time.perf_counter()
 
     stack_path = os.path.join(args.out, f"stack_{args.method}.tif")
     imgio.write_tiff16(stack_path, np.clip(linear * 65535.0, 0, 65535).astype(np.uint16))
@@ -366,10 +576,19 @@ def run(args):
                              cv2.COLOR_RGB2BGR), [cv2.IMWRITE_JPEG_QUALITY, 95])
     log(f"  wrote {final_tif} + {final_base}.jpg (full-res)"
         f"  (auto-stretch: mtf_m={mtf_m:.4f}, bg={bg:.4f}, target={args.stretch_bg})")
+    mark("final_writes", t)
+    timings["total"] = round(time.perf_counter() - t0, 3)
 
     with open(os.path.join(args.out, "transforms.json"), "w") as f:
         json.dump(dict(reference=ref_id, reg_scale=reg_scale, frames=records),
                   f, indent=2)
+    with open(os.path.join(args.out, "timing.json"), "w") as f:
+        json.dump(dict(frames=len(files), stacked=len(records),
+                       workers=workers, io_workers=io_workers,
+                       stack_workers=stack_workers, render_workers=render_workers,
+                       timings=timings), f, indent=2)
+    log("  stage timings (s): "
+        + ", ".join(f"{k}={v:g}" for k, v in timings.items()))
 
     if median_store is not None:
         del median_store
@@ -378,5 +597,5 @@ def run(args):
         except OSError:
             pass
 
-    log(f"done in {time.time()-t0:.1f}s -> {os.path.abspath(args.out)}")
+    log(f"done in {time.perf_counter()-t0:.1f}s -> {os.path.abspath(args.out)}")
     log(f"  {len(records)} frames stacked ({args.method})")
