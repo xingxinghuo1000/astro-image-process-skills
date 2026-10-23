@@ -62,16 +62,20 @@ def build_parser():
                          "(default 0 = one per frame up to the CPU count)")
     ap.add_argument("--io-workers", type=int, default=0, metavar="N",
                     help="parallel CR2 decode workers for previews and the "
-                         "full-res stacking pass (default 0 = 8, bounded so "
-                         "only ~2*N decoded frames are held in RAM)")
+                         "full-res stacking pass (default 0 = auto from CPU "
+                         "count and RAM, capped at 16; ~2*N decoded frames "
+                         "are held in RAM)")
     ap.add_argument("--stack-workers", type=int, default=0, metavar="N",
                     help="parallel row-band workers for the median stack "
-                         "(default 0 = 8; each band is sized to ~1 GB; the "
-                         "NaN-aware border path needs a temporary copy, so "
-                         "budget ~2-3xN GB)")
+                         "(default 0 = auto from CPU count and RAM; on a "
+                         "72-core machine this selects 72)")
+    ap.add_argument("--stack-band-mb", type=int, default=0, metavar="MB",
+                    help="target working set per median row band (default 0 = "
+                         "16 MB). Smaller bands use less RAM and expose more "
+                         "parallel work; the minimum is one image row")
     ap.add_argument("--render-workers", type=int, default=0, metavar="N",
                     help="parallel workers for per-stage TIFF/JPEG writing "
-                         "(default 0 = 4)")
+                         "(default 0 = auto from CPU count, capped at 8)")
     ap.add_argument("--no-static", action="store_true",
                     help="disable static-pattern subtraction (automatic for "
                          "sky-tracked sequences, where a percentile map would "
@@ -158,9 +162,9 @@ def build_parser():
 
     c = ap.add_argument_group("sky/ground composite (天地合成)")
     c.add_argument("--composite", action="store_true",
-                   help="stitch the star-aligned sky onto a static ground layer "
-                        "(the un-registered average of the frames), split at the "
-                        "detected sky-ground boundary ('天地分界线')")
+                   help="stitch the star-aligned sky onto a temporally stacked "
+                        "ground layer, split at the detected sky-ground boundary "
+                        "('天地分界线')")
     c.add_argument("--composite-horizon", choices=["mask", "line"], default="mask",
                    help="'mask' follows a ragged tree/terrain line (default); "
                         "'line' forces a robust straight horizon fit")
@@ -175,6 +179,10 @@ def build_parser():
                    help="path to a ground mask (grayscale PNG, white = ground) "
                         "recognised by a large image model; overrides the "
                         "variance-based boundary detection")
+    c.add_argument("--ground-method", choices=["mean", "median"], default="median",
+                   help="combine the ground layer: median (default) rejects "
+                        "transient flashlight/people and hot pixels; mean keeps "
+                        "light painting")
     c.add_argument("--ground-dir", default="",
                    help="use a separate foreground sequence for the ground layer "
                         "(default: the input frames, un-registered)")

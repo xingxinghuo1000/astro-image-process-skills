@@ -170,9 +170,10 @@ align_stack.py
   --method {mean,median}   combiner (default: median; mean is discouraged)
   --exclude 6007,6012      drop specific frames
   --workers N              parallel registration threads (default 0 = auto)
-  --io-workers N           parallel CR2 decoders (default 0 = 8)
-  --stack-workers N        parallel median row bands (default 0 = 8)
-  --render-workers N       parallel stage TIFF/JPEG writers (default 0 = 4)
+  --io-workers N           parallel CR2 decoders (default 0 = auto, cap 16)
+  --stack-workers N        parallel median row bands (default 0 = auto)
+  --stack-band-mb MB       target median band working set (default 0 = 16 MB)
+  --render-workers N       parallel stage TIFF/JPEG writers (default 0 = auto, cap 8)
   --no-static              disable static-pattern subtraction
   --stretch-bg 0.20        target sky-background level after stretch
   --save-frames            also save each aligned full-res frame
@@ -199,6 +200,7 @@ Hot pixels
 Sky/ground composite (天地合成)
   --composite              enable
   --ground-mask PATH       ground mask from a large vision model (white = ground)
+  --ground-method {mean,median}   ground combiner (default: median)
   --composite-horizon {mask,line}
   --composite-thresh 0.05 --composite-feather 25
   --ground-dir DIR --ground-start N --ground-end N   ground from another sequence
@@ -263,10 +265,11 @@ Check `out/sky_ground_overlay.jpg`: the boundary is drawn in cyan and should hug
 the foreground; the sky must be free of star trails. The final image is
 `out/merge_final_5994_6012.tif/.jpg`.
 
-> The composite needs a **static foreground**. On a fixed tripod the ground layer
-> is the un-registered average of the frames; on a sky-tracked sequence it uses
-> the **reference frame only**, because the foreground moves with the tracker.
-> With dedicated foreground frames, use `--ground-dir` (scenario 6).
+> The composite needs a **static foreground**. The ground layer is stacked from
+> all accepted frames (median by default; `--ground-method mean` keeps light
+> painting). On a sky-tracked sequence the ground is translation-aligned first
+> when the measured motion is significant. With dedicated foreground frames,
+> use `--ground-dir` (scenario 6).
 
 **4. Light-pollution gradient only — compare flat strengths first**
 
@@ -326,10 +329,11 @@ Optional steps are added to the stage list only when their flag is set, and the
    (memmap-backed) or a weighted mean → `stage1_stacked`.
 4. **Hot-pixel repair** (`--hot-post`) — per-channel detection on the stacked
    master and cosmetic repair → `stage2_hotfix`.
-5. **Sky/ground composite** (`--composite`) — build a static ground layer (the
-   un-registered average), get the sky/ground boundary (large-model `--ground-mask`
-   or temporal-variance detection), and blend the two layers with a feathered
-   mask → `stageN_composite`. This becomes the linear master for later steps.
+5. **Sky/ground composite** (`--composite`) — build a temporal ground layer
+   (median by default; `--ground-method mean` keeps light painting), get the
+   sky/ground boundary (large-model `--ground-mask` or temporal-variance
+   detection), and blend the two layers with a feathered mask →
+   `stageN_composite`. This becomes the linear master for later steps.
 6. **Auto flat / ABE** (`--flat`) — fit a smooth per-channel 2D background on the
    **linear** image and subtract/divide it, blended by `--flat-strength` →
    `stageN_flat`. Writes `flat_compare.jpg` for a visual decision.

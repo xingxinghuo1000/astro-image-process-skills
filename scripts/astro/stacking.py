@@ -4,6 +4,8 @@ import warnings
 import cv2
 import numpy as np
 
+from .util import available_memory_gb
+
 
 def _warp(img, M, W, H, interp):
     if np.asarray(M).shape == (3, 3):
@@ -33,20 +35,22 @@ def make_median_store(path, n, H, W):
     return np.memmap(path, dtype=np.uint16, mode="w+", shape=(n, H, W, 3))
 
 
-def median_stack(store, H, W, step=None, workers=1):
+def median_stack(store, H, W, step=None, workers=1, band_mb=16):
     """Block-wise median over the aligned uint16 frames.
 
     The median is the expensive step: a full-res 124-frame stack is ~15 GB and
     ``np.nanmedian`` takes ~20 min single-threaded.  Numpy releases the GIL in
     the sort/partition kernels, so independent row bands can run in threads.
-    ``step`` is chosen adaptively to keep one band near 1 GB; the caller caps
-    ``workers`` so peak RAM stays bounded (each worker also needs a temporary
-    copy for the nanmedian; budget roughly 2-3x the band size)."""
+    ``step`` is chosen adaptively to keep one band near ``band_mb``; smaller
+    bands use less RAM and expose more parallel work, at the cost of more
+    Python/task overhead.  The worker count is also capped by available RAM
+    because the NaN-aware border path needs a temporary copy."""
     n = store.shape[0]
     if step is None:
-        # N * rows * W * 3 channels * float32 bytes -> rows for ~1 GB.
-        step = int(1_000_000_000 / max(1, n * W * 3 * 4))
-        step = max(16, min(256, step))
+        # N * rows * W * 3 channels * float32 bytes -> rows for ~band_mb MB.
+        target = max(1.0, float(band_mb)) * 1e6
+        step = int(target / max(1, n * W * 3 * 4))
+        step = max(1, min(256, step))
     bands = [(r0, min(H, r0 + step)) for r0 in range(0, H, step)]
     stack = np.empty((H, W, 3), np.float32)
 
@@ -75,6 +79,10 @@ def median_stack(store, H, W, step=None, workers=1):
                 med.flat[idx] = np.nanmedian(sub, axis=0)
         stack[r0:r1] = med
 
+    band_bytes = n * (bands[0][1] - bands[0][0]) * W * 3 * 4
+    mem = available_memory_gb()
+    if mem is not None:
+        workers = min(workers, max(1, int(mem * 0.5e9 / max(1, band_bytes * 3))))
     workers = max(1, min(int(workers), len(bands)))
     if workers == 1:
         for band in bands:

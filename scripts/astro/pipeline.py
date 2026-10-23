@@ -16,7 +16,7 @@ from concurrent.futures import ThreadPoolExecutor
 import numpy as np
 import cv2
 
-from .util import log
+from .util import log, auto_workers, cpu_count, available_memory_gb
 from . import imgio
 from . import registration as reg
 from . import stacking
@@ -113,9 +113,23 @@ def run(args):
     def mark(name, started):
         timings[name] = round(time.perf_counter() - started, 3)
 
-    io_workers = args.io_workers if args.io_workers > 0 else min(
-        8, os.cpu_count() or 1)
+    cpus = cpu_count()
+    avail_mem = available_memory_gb()
+    workers = args.workers if args.workers > 0 else auto_workers(
+        "registration", len(files))
+    io_workers = args.io_workers if args.io_workers > 0 else auto_workers(
+        "io", len(files))
+    stack_workers = args.stack_workers if args.stack_workers > 0 else auto_workers(
+        "stack", len(files))
+    stack_band_mb = args.stack_band_mb if args.stack_band_mb > 0 else 16
+    render_workers = args.render_workers if args.render_workers > 0 else auto_workers(
+        "render", 16)
+    workers = max(1, min(workers, len(files)))
     io_workers = max(1, min(io_workers, len(files)))
+    mem_txt = f"{avail_mem:.1f} GB" if avail_mem is not None else "unknown"
+    log(f"workers: registration={workers}, io={io_workers}, "
+        f"stack={stack_workers}@{stack_band_mb}MB, render={render_workers} "
+        f"(cpu={cpus}, available RAM={mem_txt})")
 
     ground_mask_img = None
     if args.ground_mask:
@@ -205,10 +219,75 @@ def run(args):
         log("  !! reference frame has no ORB features; aborting")
         return
 
+    ground_bbox = None
+    if args.composite and not args.ground_dir:
+        if ground_mask_img is not None:
+            ys, xs = np.where(ground_mask_img > 127)
+            if len(ys):
+                gy0, gy1 = int(ys.min()), int(ys.max()) + 1
+                gx0, gx1 = int(xs.min()), int(xs.max()) + 1
+            else:
+                gy0, gy1, gx0, gx1 = int(H * 0.65), H, 0, W
+        else:
+            gy0, gy1, gx0, gx1 = int(H * 0.65), H, 0, W
+        gy0, gy1 = max(0, gy0), min(H, gy1)
+        gx0, gx1 = max(0, gx0), min(W, gx1)
+        if gy1 - gy0 >= 32 and gx1 - gx0 >= 32:
+            ground_bbox = (gy0, gy1, gx0, gx1)
+
+    ground_shift = None
+    ground_resp = None
+    ground_static = True
+    if args.composite and tracked and not args.ground_dir:
+        if ground_bbox is not None:
+            gy0, gy1, gx0, gx1 = ground_bbox
+            hy0, hy1 = max(0, gy0 // 2), min(gh, (gy1 + 1) // 2)
+            hx0, hx1 = max(0, gx0 // 2), min(gw, (gx1 + 1) // 2)
+            if hy1 - hy0 >= 16 and hx1 - hx0 >= 16:
+                ground_shift = np.zeros((len(files), 2), np.float32)
+                ground_resp = np.zeros(len(files), np.float32)
+                ref_ground = cleaned[k_ref][hy0:hy1, hx0:hx1].astype(np.float32)
+                win = cv2.createHanningWindow((hx1 - hx0, hy1 - hy0), cv2.CV_32F)
+                for k in range(len(files)):
+                    if k == k_ref:
+                        ground_resp[k] = 1.0
+                        continue
+                    mov = cleaned[k][hy0:hy1, hx0:hx1].astype(np.float32)
+                    try:
+                        (dx, dy), resp = cv2.phaseCorrelate(mov, ref_ground, win)
+                    except cv2.error:
+                        continue
+                    if not np.isfinite([dx, dy, resp]).all() or resp < 0.005:
+                        dx = dy = 0.0
+                    ground_shift[k] = (dx, dy)
+                    ground_resp[k] = resp
+                norms = np.linalg.norm(ground_shift, axis=1)
+                max_shift = float(np.max(norms))
+                p95_shift = float(np.percentile(norms, 95))
+                ground_static = p95_shift < 1.5
+                log(f"  ground motion: max {max_shift:.2f} px, p95 {p95_shift:.2f} px "
+                    f"at half-res ({'static' if ground_static else 'translation-aligned'})")
+            else:
+                log("  ground motion: ground region too small; averaging unaligned frames")
+        else:
+            log("  ground motion: no usable ground region; averaging unaligned frames")
+
+    ground_store = None
+    ground_path = None
+    ground_kept = 0
+    if (args.composite and args.ground_method == "median" and not args.ground_dir
+            and ground_bbox is not None):
+        gy0, gy1, gx0, gx1 = ground_bbox
+        ground_path = os.path.join(args.out, "_ground_uint16.dat")
+        ground_store = stacking.make_median_store(
+            ground_path, len(files), gy1 - gy0, gx1 - gx0)
+        log(f"  ground median store: {gx1-gx0}x{gy1-gy0} px, {len(files)} frames")
+
     acc_sum = None
     acc_w = np.zeros((H, W), np.float32)
     ones = np.ones((H, W), np.float32)
-    ground_acc = np.zeros((H, W, 3), np.float32) if args.composite else None
+    ground_acc = (np.zeros((H, W, 3), np.float32)
+                  if args.composite and ground_store is None else None)
     ground_n = 0
     # Temporal-motion accumulator (half-res) for the sky/ground boundary: the
     # raw frames vary over the sky (the stars move) and are static over the
@@ -228,10 +307,6 @@ def run(args):
         mm_path = os.path.join(args.out, "_aligned_uint16.dat")
         median_store = stacking.make_median_store(mm_path, len(files), H, W)
 
-    workers = args.workers if args.workers > 0 else min(len(files),
-                                                       os.cpu_count() or 1)
-    workers = max(1, min(workers, len(files)))
-    stack_workers = 1
     log(f"pass 2: registering {len(files)} frames with {workers} worker threads ...")
     t = time.perf_counter()
     tasks = [(k, idx, cleaned[k], ref_id, ref_enh, ref_kp, ref_desc,
@@ -286,7 +361,7 @@ def run(args):
         M_full = r["M_full"]
         gd, minl, sc = r["gd"], r["inl"], r["sc"]
 
-        if ground_acc is not None:
+        if args.composite:
             if var_sum is None:
                 var_sum = np.zeros((gh, gw), np.float32)
                 var_sq = np.zeros((gh, gw), np.float32)
@@ -320,9 +395,23 @@ def run(args):
             median_store[kept] = np.clip(warped * 65535.0, 0, 65535).astype(np.uint16)
             kept += 1
 
-        if ground_acc is not None and (not tracked or idx == ref_id):
-            ground_acc += lin
-            ground_n += 1
+        if ground_acc is not None or ground_store is not None:
+            glin = lin
+            if tracked and not ground_static:
+                dx, dy = ground_shift[k]
+                if ground_resp[k] >= 0.005:
+                    gm = np.float32([[1, 0, dx * 2], [0, 1, dy * 2]])
+                    glin = cv2.warpAffine(
+                        lin, gm, (W, H), flags=cv2.INTER_LINEAR,
+                        borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+            if ground_store is not None:
+                gy0, gy1, gx0, gx1 = ground_bbox
+                ground_store[ground_kept] = np.clip(
+                    glin[gy0:gy1, gx0:gx1] * 65535.0, 0, 65535).astype(np.uint16)
+                ground_kept += 1
+            else:
+                ground_acc += glin
+                ground_n += 1
 
         if args.save_frames:
             imgio.write_tiff16(os.path.join(frames_dir, f"IMG_{idx}.tif"),
@@ -351,12 +440,11 @@ def run(args):
         if kept == 0:
             log("  no frames registered; nothing to stack")
             return
-        stack_workers = args.stack_workers if args.stack_workers > 0 else min(
-            8, os.cpu_count() or 1)
         log(f"  computing median over {kept} accepted frames "
             f"({stack_workers} row-band workers) ...")
         stack = stacking.median_stack(median_store[:kept], H, W,
-                                      workers=stack_workers)
+                                      workers=stack_workers,
+                                      band_mb=stack_band_mb)
     mark("stacking", t)
 
     # ---- staged post-processing ----
@@ -384,9 +472,10 @@ def run(args):
         mark("hotfix", t)
 
     # ---- optional sky/ground composite -----------------------------------------
-    # Stitch the star-aligned sky onto a static ground layer (the plain average of
-    # the frames), splitting them at the detected sky-ground boundary.  This
-    # replaces the linear master that every later step operates on.
+    # Stitch the star-aligned sky onto a temporal ground layer, splitting them at
+    # the detected sky-ground boundary.  For tracked sequences the ground is
+    # translation-aligned first; for static tripod sequences every frame is
+    # already aligned.  This replaces the linear master that later steps use.
     sky_mask = None
     t = time.perf_counter()
     if args.composite:
@@ -395,9 +484,25 @@ def run(args):
             if ground is None:
                 log("  !! composite: no ground frames found; using the input frames")
                 ground = stacking.mean_ground(ground_acc, ground_n)
+        elif ground_store is not None:
+            gy0, gy1, gx0, gx1 = ground_bbox
+            log(f"  ground layer: median of {ground_kept} frames "
+                f"({gx1-gx0}x{gy1-gy0} px, "
+                f"{'static foreground' if ground_static else 'translation-aligned'})")
+            ground = master.copy()
+            gcrop = stacking.median_stack(
+                ground_store[:ground_kept], gy1 - gy0, gx1 - gx0,
+                workers=stack_workers, band_mb=stack_band_mb)
+            if ground_mask_img is not None:
+                gm = ground_mask_img[gy0:gy1, gx0:gx1] > 127
+                dst = ground[gy0:gy1, gx0:gx1]
+                dst[gm] = gcrop[gm]
+            else:
+                ground[gy0:gy1, gx0:gx1] = gcrop
+            ground_n = ground_kept
         else:
-            log(f"  ground layer: averaging {ground_n} unaligned frames "
-                "(static foreground)")
+            log(f"  ground layer: mean of {ground_n} frames "
+                f"({'static foreground' if ground_static else 'translation-aligned'})")
             ground = stacking.mean_ground(ground_acc, ground_n)
         sigma = max(8.0, 0.01 * gw)
         evidence = horizon.sky_evidence(
@@ -515,8 +620,6 @@ def run(args):
     # ---- every stage as its own TIFF + preview, plus a comparison montage ----
     log("  writing per-stage images ...")
     t = time.perf_counter()
-    render_workers = args.render_workers if args.render_workers > 0 else min(
-        4, os.cpu_count() or 1)
     render_workers = max(1, min(render_workers, len(stages)))
     if render_workers > 1:
         with ThreadPoolExecutor(max_workers=render_workers) as ex:
@@ -584,8 +687,11 @@ def run(args):
                   f, indent=2)
     with open(os.path.join(args.out, "timing.json"), "w") as f:
         json.dump(dict(frames=len(files), stacked=len(records),
+                       cpu=cpus, available_ram_gb=(round(avail_mem, 1)
+                                                   if avail_mem is not None else None),
                        workers=workers, io_workers=io_workers,
-                       stack_workers=stack_workers, render_workers=render_workers,
+                       stack_workers=stack_workers, stack_band_mb=stack_band_mb,
+                       render_workers=render_workers,
                        timings=timings), f, indent=2)
     log("  stage timings (s): "
         + ", ".join(f"{k}={v:g}" for k, v in timings.items()))
@@ -594,6 +700,12 @@ def run(args):
         del median_store
         try:
             os.remove(mm_path)
+        except OSError:
+            pass
+    if ground_store is not None:
+        del ground_store
+        try:
+            os.remove(ground_path)
         except OSError:
             pass
 
