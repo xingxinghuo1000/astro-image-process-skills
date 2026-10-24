@@ -168,3 +168,128 @@ def scale_matrix(M, s):
     M = _as_homography(M)
     S = np.diag([s, s, 1.0]).astype(np.float32)
     return (S @ M @ np.linalg.inv(S)).astype(np.float32)
+
+
+# ---------------------------------------------------------------------------
+# Ground-layer registration for sky-tracked sequences.
+#
+# A tracking mount rotates the camera *against the ground*: the apparent
+# ground motion between frames is the image of a 3-D rotation, i.e. a
+# homography (rotation around the polar-axis point + perspective terms), NOT
+# a translation.  A single translation only locks the crop's centroid and
+# leaves a lever-arm residual that grows linearly with distance to the
+# centre -- the wide-angle artefact "aligned in the middle, ghosted at the
+# corners".  We measure the per-frame homography from 8 block
+# phase-correlations over the ground crop: the dark flashlight-lit grass has
+# no features that match reliably (ORB fits on it collapse to garbage), but
+# a block grid gives 8 point correspondences -- exactly the 8 DOF of a
+# homography -- from pure correlation.
+# ---------------------------------------------------------------------------
+
+def ground_blocks(wm, ny=2, nx=4, min_px=96, cov=0.5):
+    """Grid of block windows over the ground crop; `wm` is the (eroded)
+    ground-mask weight.  Blocks need a minimum size and mask coverage."""
+    h, w = wm.shape
+    ys_ = np.linspace(0, h, ny + 1).astype(int)
+    xs_ = np.linspace(0, w, nx + 1).astype(int)
+    out = []
+    for i in range(ny):
+        for j in range(nx):
+            y0, y1, x0, x1 = ys_[i], ys_[i + 1], xs_[j], xs_[j + 1]
+            if (x1 - x0) < min_px or (y1 - y0) < min_px:
+                continue
+            mb = wm[y0:y1, x0:x1]
+            if mb.mean() < cov:
+                continue
+            wb = cv2.createHanningWindow((x1 - x0, y1 - y0), cv2.CV_32F) * mb
+            out.append(((y0, y1, x0, x1), np.ascontiguousarray(wb, np.float32)))
+    return out
+
+
+def ground_block_shifts(mov, ref, blocks):
+    """Per-block phase-correlation displacement of `mov` vs `ref`
+    (mov(p) ~ ref(p + d(p))).  Returns (((x, y), (dx, dy), response), ...)."""
+    rows = []
+    for (y0, y1, x0, x1), wb in blocks:
+        a = np.ascontiguousarray(mov[y0:y1, x0:x1], np.float32) * wb
+        b = np.ascontiguousarray(ref[y0:y1, x0:x1], np.float32) * wb
+        try:
+            (dx, dy), resp = cv2.phaseCorrelate(a, b, None)
+        except cv2.error:
+            continue
+        if np.isfinite([dx, dy, resp]).all():
+            rows.append((((x0 + x1) / 2.0, (y0 + y1) / 2.0),
+                         (float(dx), float(dy)), float(resp)))
+    return rows
+
+
+def homography_from_shifts(rows, crop_w, crop_h, min_resp=0.05,
+                           max_reproj=3.0, max_rot=8.0,
+                           scale_lo=0.9, scale_hi=1.1):
+    """Least-squares homography through the block displacement correspondences,
+    with a plausibility gate (reprojection, rotation, scale, shift)."""
+    pts = [r for r in rows if r[2] >= min_resp]
+    if len(pts) < 4:
+        return None, dict(npts=len(pts), ok=False)
+    src = np.float32([[p[0][0], p[0][1]] for p in pts]).reshape(-1, 1, 2)
+    dst = np.float32([[p[0][0] + p[1][0], p[0][1] + p[1][1]]
+                      for p in pts]).reshape(-1, 1, 2)
+    M = cv2.findHomography(src, dst, method=0)
+    if M is None or M[0] is None:
+        return None, dict(npts=len(pts), ok=False)
+    M = M[0].astype(np.float64)
+    d = cv2.perspectiveTransform(src, M).reshape(-1, 2) - dst.reshape(-1, 2)
+    med = float(np.median(np.linalg.norm(d, axis=1)))
+    rot, tx, ty, scale, det = homography_metrics(M, crop_w, crop_h)
+    ok = (med <= max_reproj and abs(rot) < max_rot and det > 0
+          and scale_lo <= scale <= scale_hi
+          and np.hypot(tx, ty) < 0.5 * crop_w)
+    if not ok:
+        return None, dict(npts=len(pts), reproj=med, rot=rot, tx=tx, ty=ty,
+                          scale=scale, ok=False)
+    return M / M[2, 2], dict(npts=len(pts), reproj=med, rot=rot, tx=tx,
+                             ty=ty, scale=scale, ok=True)
+
+
+def eval_temporal_homography(coef, k):
+    v = np.asarray(coef, np.float64) @ np.array([float(k), 1.0])
+    return np.array([[v[0], v[1], v[2]], [v[3], v[4], v[5]], [v[6], v[7], 1.0]])
+
+
+def temporal_homography(items, crop_w, crop_h, max_corner_dev=20.0):
+    """items: [(k, M)] with M mapping frame k's crop to the crop reference.
+    Fit each of the 8 (h33-normalised) coefficients linearly in the frame
+    index, with corner-deviation outlier passes.
+
+    A short lit window carries large slope noise, so the model is only used
+    INSIDE the lit window (the ground layer is the window's frames, anchored
+    at the window centre); linear is exact there for a mount rotating at
+    constant rate (arc sagitta over the window < 1 px)."""
+    ks = np.array([k for k, _ in items], np.float64)
+    C = np.stack([M.ravel()[:8] for _, M in items])
+    corners = np.float32([[0, 0], [crop_w, 0], [0, crop_h],
+                          [crop_w, crop_h]]).reshape(-1, 1, 2)
+    coef = np.stack([np.polyfit(ks, C[:, j], 1) for j in range(8)])
+    dev = np.zeros(len(items))
+    kept = len(items)
+    for _ in range(2):
+        pred = np.stack([eval_temporal_homography(coef, k) for k in ks])
+        for i, (k, M) in enumerate(items):
+            D = np.linalg.inv(pred[i]) @ M
+            wc = cv2.perspectiveTransform(corners, D.astype(np.float32)).reshape(-1, 2)
+            dev[i] = float(np.max(np.linalg.norm(wc - corners.reshape(-1, 2), axis=1)))
+        keep = dev <= max(max_corner_dev, np.median(dev))
+        if keep.all() or keep.sum() < 3:
+            break
+        coef = np.stack([np.polyfit(ks[keep], C[keep][:, j], 1) for j in range(8)])
+        kept = int(keep.sum())
+    return coef, dict(dev=[round(float(d), 2) for d in dev], kept=kept)
+
+
+def corner_displacement(M, crop_w, crop_h):
+    """Max displacement of the crop corners under M (maps crop coords onto
+    the target position); the lever arm that a translation-only warp misses."""
+    corners = np.float32([[0, 0], [crop_w, 0], [0, crop_h],
+                          [crop_w, crop_h]]).reshape(-1, 1, 2)
+    wc = cv2.perspectiveTransform(corners, np.asarray(M, np.float32)).reshape(-1, 2)
+    return float(np.max(np.linalg.norm(wc - corners.reshape(-1, 2), axis=1)))

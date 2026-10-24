@@ -30,6 +30,11 @@ from . import horizon
 from . import render
 from . import hotpixels
 
+# Median full-res star displacement (px) under which the sequence is judged
+# sky-tracked: registration barely had to move the stars, so the camera rode a
+# tracking mount and the *ground* is what sweeps across the frames.
+STAR_TRACK_MAX_PX = 12.0
+
 
 def _register_task(task):
     """Per-frame registration work, safe to run in a thread pool."""
@@ -81,6 +86,308 @@ def _stack_ground_from_dir(args):
         acc = np.zeros_like(lin) if acc is None else acc
         acc += lin
     return acc / len(gfiles)
+
+
+def _plan_ground_motion(args, files, cleaned, ground_mask_img, ground_bbox,
+                        gw, gh, stars_tracked, ground_keep):
+    """Per-frame ground warps (full-res 3x3, crop-space model scaled x2) for
+    the composite ground layer.  Returns (ground_shift, ground_M,
+    ground_static, ground_keep).
+
+    Fixed tripod: the ground is static, no warp.  Sky-tracked: the camera
+    rotates *against the ground*, so the apparent ground motion is a
+    homography (rotation around the polar-axis point + wide-angle
+    perspective terms).  A translation-only warp locks the crop centroid and
+    leaves a lever-arm residual growing toward the edges -- "aligned in the
+    middle, ghosted at the corners".  We fit a per-frame homography from 8
+    block phase-correlations on the ground crop (the dark flashlight-lit
+    grass has no features that match; correlation does not need them), and
+    restrict the ground layer to a temporally CONTIGUOUS lit cluster:
+    correlation across flashlight clusters is meaningless (the lit scene
+    patch changes with the beam) and a short-window model must never be
+    extrapolated over the whole sequence.  The layer is anchored at the
+    cluster centre so the model mask (drawn from the ground preview) lines
+    up.  Fallback: the legacy translation arc; last resort: no warp.
+    """
+    n = len(files)
+    ground_shift = None
+    ground_M = [None] * n
+    ground_static = True
+    if not stars_tracked:
+        log("  ground: fixed tripod (stars sweep) -> stacking unaligned "
+            "frames (foreground is static)")
+        return ground_shift, ground_M, ground_static, ground_keep
+    if ground_bbox is None:
+        log("  ground motion: no usable ground region; averaging unaligned frames")
+        return ground_shift, ground_M, ground_static, ground_keep
+
+    gy0, gy1, gx0, gx1 = ground_bbox
+    hy0, hy1 = max(0, gy0 // 2), min(gh, (gy1 + 1) // 2)
+    hx0, hx1 = max(0, gx0 // 2), min(gw, (gx1 + 1) // 2)
+    # On a tracked rig the stars in a rectangular ground bbox are static and
+    # out-bright the dark moving ground, so a plain phase correlation locks
+    # onto the stars and reports "static".  Weight the crop by the ground
+    # mask (sky pixels zeroed) so only the moving foreground carries the
+    # correlation.
+    gw_half = None
+    if ground_mask_img is not None:
+        gm_half = cv2.resize((ground_mask_img > 127).astype(np.uint8),
+                             (gw, gh), interpolation=cv2.INTER_NEAREST) > 0
+        gw_half = np.ascontiguousarray(
+            gm_half[hy0:hy1, hx0:hx1].astype(np.float32))
+        gw_half = cv2.erode(gw_half, np.ones((5, 5), np.uint8))
+        if gw_half.sum() < 0.02 * gw_half.size:
+            gw_half = None
+    elif ground_bbox[0] == int(gh * 2 * 0.65):
+        log("  ground motion: no --ground-mask; stars may dominate the "
+            "crop on a tracked rig -> supply a model mask for reliable alignment")
+    if hy1 - hy0 < 16 or hx1 - hx0 < 16:
+        log("  ground motion: ground region too small; averaging unaligned frames")
+        return ground_shift, ground_M, ground_static, ground_keep
+
+    crop_w, crop_h = hx1 - hx0, hy1 - hy0
+    win = cv2.createHanningWindow((crop_w, crop_h), cv2.CV_32F)
+    wm = gw_half if gw_half is not None else np.ones((crop_h, crop_w), np.float32)
+    win = win * wm
+    crops = np.stack([cleaned[k][hy0:hy1, hx0:hx1].astype(np.float32)
+                      for k in range(n)])
+    # A dark tracked ground is out-signalled by the sensor-fixed pattern
+    # (vignetting, amp glow, hot pixels), which phase correlation locks onto
+    # at shift 0 ("static").  The temporal median of the crop is exactly
+    # that fixed pattern, so subtract it and correlate only the residual.
+    fixed = np.median(crops, axis=0)
+    # Ground texture (flashlight-lit grass) exists in only a few frames, and
+    # the sky reference frame is often a pitch-black silhouette.  Correlate
+    # every frame against the BRIGHTEST ground frame, keep the
+    # high-response (lit) measurements.
+    gref = int(np.argmax((crops * wm).mean(axis=(1, 2))))
+    ref_ground = (crops[gref] - fixed) * win
+    idxs, shs = [], []
+    for k in range(n):
+        if k == gref:
+            idxs.append(k)
+            shs.append((0.0, 0.0))
+            continue
+        mov = (crops[k] - fixed) * win
+        try:
+            (dx, dy), resp = cv2.phaseCorrelate(mov, ref_ground, None)
+        except cv2.error:
+            continue
+        if np.isfinite([dx, dy, resp]).all() and resp >= 0.05:
+            idxs.append(k)
+            shs.append((dx, dy))
+    # Top-brightness frames are also cluster candidates: a flashlight beam
+    # that sweeps exposes a LIT PATCH that changed between clusters, so the
+    # correlation response between e.g. a 10-frame window and a later
+    # 3-frame window is meaningless and gate-rejects the bright window --
+    # yet within that bright window adjacent frames correlate strongly and
+    # its ground is the one the composite wants (grass lit, detail visible).
+    if ground_keep is not None:
+        for k in np.flatnonzero(ground_keep):
+            k = int(k)
+            if k not in idxs:
+                idxs.append(k)
+                shs.append((float("nan"), float("nan")))
+        idxs.sort()
+    if len(idxs) < 3:
+        log("  ground motion: no textured (lit) ground frames to correlate; "
+            "foreground is a silhouette -> stacking unaligned")
+        return ground_shift, ground_M, ground_static, ground_keep
+
+    idxs_f = np.asarray(idxs, np.float64)
+    shs_f = np.asarray(shs, np.float64)
+    # The arc-fit fallback uses only frames with a real displacement
+    # measurement; top-brightness candidates carry NaN shifts (no response).
+    meas = np.isfinite(shs_f).all(axis=1)
+    kk = np.arange(n, dtype=np.float64)
+    if meas.sum() >= 3:
+        pred = np.stack([np.polyval(np.polyfit(idxs_f[meas], shs_f[meas][:, a], 1), kk)
+                         for a in (0, 1)], axis=1)
+        shift = (pred - pred[int(np.median(idxs_f[meas]))]).astype(np.float32)
+    else:
+        shift = np.zeros((n, 2), np.float32)
+
+    # Temporally contiguous lit clusters: correlation across a flashlight gap
+    # is meaningless (the beam moved, the lit scene patch is a different
+    # scene), and each cluster anchors its own short-range model.
+    clusters = [[idxs[0]]]
+    for k in idxs[1:]:
+        if k - clusters[-1][-1] > 4:
+            clusters.append([k])
+        else:
+            clusters[-1].append(k)
+    bright = np.array([float((crops[k] * wm).sum() / max(wm.sum(), 1.0))
+                       for k in range(n)])
+    # sqrt(n): 3 lit frames are enough for a clean median; brightness is the
+    # dominant factor for a VISIBLE ground (flashlight-lit grass beats a
+    # longer window of dim frames, which stacks dark).
+    best = max(clusters, key=lambda c: np.sqrt(len(c)) * float(np.mean(bright[c])))
+
+    # Per-frame homography from the block displacement field, cluster only.
+    # The reference is the cluster's BRIGHTEST frame: the global ground gref
+    # sits in another cluster (beam on a different scene patch), so
+    # cross-cluster block correlation would measure nothing.
+    if len(best) >= 3:
+        gref_c = max(best, key=lambda k: bright[k])
+        blocks = reg.ground_blocks(wm)
+        ref_crop = crops[gref_c] - fixed
+        items = []
+        for k in best:
+            if k == gref_c:
+                items.append((k, np.eye(3)))
+                continue
+            rows = reg.ground_block_shifts(crops[k] - fixed, ref_crop, blocks)
+            Mf, st = reg.homography_from_shifts(rows, crop_w, crop_h)
+            if Mf is not None:
+                items.append((k, Mf))
+        if len(items) >= 3:
+            coef, tinfo = reg.temporal_homography(items, crop_w, crop_h)
+            k_mid = int(np.median(best))
+            A = np.linalg.inv(reg.eval_temporal_homography(coef, k_mid))
+            S2 = np.diag([2.0, 2.0, 1.0])
+            S2i = np.linalg.inv(S2)
+            # In-plane rotation rate: slope of the per-frame rotation angles
+            # (evaluated at the crop centre by homography_metrics, which
+            # accounts for the perspective terms -- h21/h12 slopes alone
+            # do not equal rotation).
+            rot_rate = float(np.polyfit([float(k) for k, _ in items],
+                                        [reg.homography_metrics(Mf, crop_w, crop_h)[0]
+                                         for _, Mf in items], 1)[0])
+            corner_disp = []
+            for k in best:
+                Hh = A @ reg.eval_temporal_homography(coef, k)
+                ground_M[k] = (S2 @ Hh @ S2i).astype(np.float32)
+                corner_disp.append(reg.corner_displacement(Hh, crop_w, crop_h))
+            p95 = float(np.percentile(corner_disp, 95))
+            ground_static = p95 < 1.5
+            tmax = max(best, key=lambda k: abs(k - k_mid))
+            diag = dict(mode="homography",
+                        gref=int(files[gref_c][0]),
+                        anchor=int(files[k_mid][0]),
+                        cluster=[int(files[k][0]) for k in best],
+                        fits=len(items), kept=tinfo["kept"],
+                        rot_rate_deg_per_frame=round(rot_rate, 4),
+                        corner_disp_p95_px=round(p95, 2),
+                        frames=[])
+            for k, Mf in items:
+                rot, tx, ty, sc, _ = reg.homography_metrics(Mf, crop_w, crop_h)
+                diag["frames"].append(dict(
+                    frame=int(files[k][0]), rot_deg=round(rot, 4),
+                    tx=round(tx, 2), ty=round(ty, 2), scale=round(sc, 5)))
+            _write_ground_diag(args, diag)
+            _write_ground_compare(args, files, crops, fixed, coef, A, shift,
+                                  k_mid, best, tmax)
+            log(f"  ground motion: lit cluster IMG_{files[min(best)][0]}.."
+                f"IMG_{files[max(best)][0]} ({len(best)} frames, ref IMG_"
+                f"{files[gref_c][0]}): homography from 8-block correlation, "
+                f"rot rate {rot_rate:+.3f}deg/frame, anchor IMG_{files[k_mid][0]}: "
+                f"corner lever-arm displacement p95 {p95:.1f}px at half-res "
+                f"({'static' if ground_static else 'homography-aligned'})")
+            ground_keep = np.zeros(n, bool)
+            ground_keep[list(best)] = True
+            log(f"  ground layer frames: lit cluster only ({len(best)} frames; "
+                "replaces the top-brightness selection so every stacked frame "
+                "is measured against the same lit scene patch)")
+            return None, ground_M, ground_static, ground_keep
+
+    norms = np.linalg.norm(shift, axis=1)
+    p95_shift = float(np.percentile(norms, 95))
+    ground_static = p95_shift < 1.5
+    ground_shift = shift
+    k_mid = int(np.median(idxs_f))
+    log(f"  ground motion: {len(idxs)} lit frames correlated vs IMG_"
+        f"{files[gref][0]}, arc fit -> shift vs arc centre IMG_{files[k_mid][0]}: "
+        f"max {float(np.max(norms)):.2f} px, p95 {p95_shift:.2f} px at half-res "
+        f"({'static' if ground_static else 'translation-aligned'})")
+    return ground_shift, ground_M, ground_static, ground_keep
+
+
+def _write_ground_diag(args, diag):
+    path = os.path.join(args.out, "ground_align.json")
+    with open(path, "w") as f:
+        json.dump(diag, f, indent=2)
+    log(f"  wrote {path}  (per-frame ground homographies, rotation rate)")
+
+
+def _write_ground_compare(args, files, crops, fixed, coef, A, shift, k_mid,
+                          best, tmax):
+    """Inspection figure: the most extreme cluster frame warped into the
+    anchor position by the legacy translation arc vs the block homography,
+    next to the anchor crop.  Ghosting in the translation panel (grass tips
+    doubled, worse toward the edges) is exactly what the homography removes."""
+    u8 = lambda a: (np.clip(a, 0, 1) * 255 + 0.5).astype(np.uint8)
+    anchor = crops[k_mid] - fixed
+    p999 = float(np.percentile(anchor, 99.9))
+    def show(a):
+        g = np.clip(a / max(p999, 1e-6), 0, 1)
+        return cv2.cvtColor(u8(g), cv2.COLOR_GRAY2RGB)
+    Hh = A @ reg.eval_temporal_homography(coef, tmax)
+    ch, cw = crops.shape[1], crops.shape[2]
+    mov_t = cv2.warpAffine(crops[tmax] - fixed,
+                           np.float32([[1, 0, shift[tmax][0]], [0, 1, shift[tmax][1]]]),
+                           (cw, ch), borderMode=cv2.BORDER_CONSTANT)
+    mov_h = cv2.warpPerspective(crops[tmax] - fixed, Hh.astype(np.float32),
+                                (cw, ch), borderMode=cv2.BORDER_CONSTANT)
+    panels = [show(anchor), show(mov_t), show(mov_h)]
+    labels = (f"anchor IMG_{files[k_mid][0]}",
+              f"IMG_{files[tmax][0]} translation warp",
+              f"IMG_{files[tmax][0]} homography warp")
+    for p, txt in zip(panels, labels):
+        cv2.putText(p, txt, (12, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.8,
+                    (255, 255, 255), 2)
+    path = os.path.join(args.out, "ground_align_compare.jpg")
+    cv2.imwrite(path, cv2.cvtColor(np.hstack(panels), cv2.COLOR_RGB2BGR),
+                [cv2.IMWRITE_JPEG_QUALITY, 88])
+    log(f"  wrote {path}  (translation vs homography warp of IMG_"
+        f"{files[tmax][0]}, ghosting check)")
+
+
+def _build_ground_layer(args, ground_mask_img, master, ground_store, ground_bbox,
+                        ground_kept, ground_acc, ground_n, ground_static,
+                        stack_workers, stack_band_mb):
+    """Linear full-res ground layer: median of the kept (brightest, translation-
+    aligned) frames pasted into a master-based canvas inside the ground bbox,
+    with warp-edge pixels filled from the master; mean fallback."""
+    if args.ground_dir:
+        ground = _stack_ground_from_dir(args)
+        if ground is None:
+            log("  !! composite: no ground frames found; using the input frames")
+            ground = stacking.mean_ground(ground_acc, ground_n)
+        return ground
+    if ground_store is not None:
+        gy0, gy1, gx0, gx1 = ground_bbox
+        ground = master.copy()
+        if not ground_kept:
+            log("  !! composite: no ground frames stacked; using the sky stack")
+            return ground
+        log(f"  ground layer: median of {ground_kept} frames "
+            f"({gx1-gx0}x{gy1-gy0} px, "
+            f"{'static foreground' if ground_static else 'translation-aligned'})")
+        gcrop = stacking.median_stack(
+            ground_store[:ground_kept], gy1 - gy0, gx1 - gx0,
+            workers=stack_workers, band_mb=stack_band_mb)
+        # Pixels the shifted frames never cover (warp edges) stay 0 in every
+        # stacked frame; fill them from the sky master, whose foreground sits
+        # at the same aligned position as the ground layer (dark, continuous
+        # -- no seam, no black strip).
+        inv = (gcrop.sum(axis=2) <= 0)
+        if inv.any():
+            gcrop[inv] = master[gy0:gy1, gx0:gx1][inv]
+            log(f"  ground layer: filled {100.0 * inv.mean():.1f}% "
+                f"warp-edge pixels from the sky master")
+        dst = ground[gy0:gy1, gx0:gx1]
+        if ground_mask_img is not None:
+            gm = ground_mask_img[gy0:gy1, gx0:gx1] > 127
+            dst[gm] = gcrop[gm]
+        else:
+            dst[...] = gcrop
+        return ground
+    if ground_n:
+        log(f"  ground layer: mean of {ground_n} frames "
+            f"({'static foreground' if ground_static else 'translation-aligned'})")
+        return stacking.mean_ground(ground_acc, ground_n)
+    log("  !! composite: no ground frames stacked; using the sky stack")
+    return master.copy()
 
 
 def run(args):
@@ -164,13 +471,29 @@ def run(args):
             f"of the half-res frame)")
 
     k_ref = [i for i, (idx, _) in enumerate(files) if idx == ref_id][0]
+    # Pixel correlation collapses under a 1-2 px shift, so a tracking mount with
+    # a little periodic-error drift reads as "untracked" and the static-pattern
+    # subtraction erases the stars it needs.  Phase correlation tolerates the
+    # shift, so use it as a second probe: on a tracking mount the sky shifts by
+    # tens of px between distant probes; on a fixed tripod it sweeps hundreds.
     tracked = False
     if len(grays) >= 5:
         a = reg.highpass_float(grays[k_ref])
         sl = slice(0, int(gh * 0.55))
         probes = sorted({len(grays) // 4, len(grays) // 2,
                          3 * len(grays) // 4, len(grays) - 1})
-        corrs = []
+        crop = (0, int(gh * 0.55), 0, gw)
+        if reg_mask is not None:
+            ys = np.flatnonzero(reg_mask[:crop[1]].any(axis=1))
+            xs = np.flatnonzero(reg_mask[:crop[1]].any(axis=0))
+            if len(ys) >= 32 and len(xs) >= 32:
+                crop = (int(ys.min()), int(ys.max()) + 1,
+                        int(xs.min()), int(xs.max()) + 1)
+        ca = np.ascontiguousarray(
+            a[crop[0]:crop[1], crop[2]:crop[3]].astype(np.float32))
+        win = cv2.createHanningWindow((crop[3] - crop[2], crop[1] - crop[0]),
+                                      cv2.CV_32F)
+        corrs, shifts, resps = [], [], []
         for k in probes:
             if k == k_ref:
                 continue
@@ -184,12 +507,28 @@ def run(args):
             bb = bb - bb.mean()
             corrs.append(float((aa * bb).sum() /
                                (np.linalg.norm(aa) * np.linalg.norm(bb) + 1e-9)))
+            cb = np.ascontiguousarray(
+                b[crop[0]:crop[1], crop[2]:crop[3]].astype(np.float32))
+            try:
+                (dx, dy), resp = cv2.phaseCorrelate(cb, ca, win)
+            except cv2.error:
+                continue
+            if np.isfinite([dx, dy, resp]).all():
+                shifts.append(float(np.hypot(dx, dy)))
+                resps.append(float(resp))
         corr = float(np.median(corrs)) if corrs else 0.0
+        probe_px = float(np.median(shifts)) if shifts else None
+        resp_med = float(np.median(resps)) if resps else 0.0
         if corr > 0.65:
             tracked = True
             log(f"  sky is nearly static around the reference frame "
                 f"(high-pass corr={corr:.2f}): treating as tracked; "
                 f"static-pattern subtraction disabled")
+        elif probe_px is not None and probe_px < 40.0 and resp_med > 0.02:
+            tracked = True
+            log(f"  sky shifts by only {probe_px:.1f} px between distant probe "
+                f"frames (phase-corr response {resp_med:.3f}): treating as "
+                f"tracked; static-pattern subtraction disabled")
     if not args.no_static and not tracked:
         static = reg.build_static_map(grays)
         cleaned = [np.clip(g - static, 0, None) for g in grays]
@@ -206,6 +545,18 @@ def run(args):
 
     reg_scale = 0.5
     H, W = gh * 2, gw * 2
+
+    # Feathered sky mask (1 = sky) from the model ground mask: used to keep the
+    # sky/ground stitch, the background neutralization and the white balance
+    # all restricted to the sky.
+    sky_mask = None
+    if args.composite and ground_mask_img is not None:
+        gmfull = cv2.resize(ground_mask_img, (W, H), interpolation=cv2.INTER_LINEAR)
+        sky = 1.0 - gmfull.astype(np.float32) / 255.0
+        sky = cv2.GaussianBlur(sky, (0, 0), max(1.0, args.composite_feather))
+        sky_mask = np.clip(sky, 0, 1).astype(np.float32)
+        log(f"  ground mask (model): {args.ground_mask}  "
+            f"ground={100.0 * (gmfull > 127).mean():.1f}%")
 
     t = time.perf_counter()
     orb = reg.make_detector()
@@ -235,60 +586,44 @@ def run(args):
         if gy1 - gy0 >= 32 and gx1 - gx0 >= 32:
             ground_bbox = (gy0, gy1, gx0, gx1)
 
-    ground_shift = None
-    ground_resp = None
-    ground_static = True
-    if args.composite and tracked and not args.ground_dir:
+    # A foreground light (flashlight / light painting) is often present in only
+    # a handful of frames.  Median over the whole sequence rejects it and leaves
+    # a dark, detail-free ground; select the brightest ground frames instead.
+    ground_keep = None
+    if args.composite and not args.ground_dir:
+        if ground_mask_img is not None:
+            gm_half = cv2.resize(
+                (ground_mask_img > 127).astype(np.uint8), (gw, gh),
+                interpolation=cv2.INTER_NEAREST) > 0
+        else:
+            gm_half = np.zeros((gh, gw), bool)
+            gm_half[int(gh * 0.65):] = True
         if ground_bbox is not None:
             gy0, gy1, gx0, gx1 = ground_bbox
-            hy0, hy1 = max(0, gy0 // 2), min(gh, (gy1 + 1) // 2)
-            hx0, hx1 = max(0, gx0 // 2), min(gw, (gx1 + 1) // 2)
-            if hy1 - hy0 >= 16 and hx1 - hx0 >= 16:
-                ground_shift = np.zeros((len(files), 2), np.float32)
-                ground_resp = np.zeros(len(files), np.float32)
-                ref_ground = cleaned[k_ref][hy0:hy1, hx0:hx1].astype(np.float32)
-                win = cv2.createHanningWindow((hx1 - hx0, hy1 - hy0), cv2.CV_32F)
-                for k in range(len(files)):
-                    if k == k_ref:
-                        ground_resp[k] = 1.0
-                        continue
-                    mov = cleaned[k][hy0:hy1, hx0:hx1].astype(np.float32)
-                    try:
-                        (dx, dy), resp = cv2.phaseCorrelate(mov, ref_ground, win)
-                    except cv2.error:
-                        continue
-                    if not np.isfinite([dx, dy, resp]).all() or resp < 0.005:
-                        dx = dy = 0.0
-                    ground_shift[k] = (dx, dy)
-                    ground_resp[k] = resp
-                norms = np.linalg.norm(ground_shift, axis=1)
-                max_shift = float(np.max(norms))
-                p95_shift = float(np.percentile(norms, 95))
-                ground_static = p95_shift < 1.5
-                log(f"  ground motion: max {max_shift:.2f} px, p95 {p95_shift:.2f} px "
-                    f"at half-res ({'static' if ground_static else 'translation-aligned'})")
+            region = np.zeros((gh, gw), bool)
+            region[max(0, gy0 // 2):min(gh, (gy1 + 1) // 2),
+                   max(0, gx0 // 2):min(gw, (gx1 + 1) // 2)] = True
+            gm_half &= region
+        if gm_half.any():
+            n_all = len(files)
+            if args.ground_top < 0:
+                n_top = n_all
+            elif args.ground_top > 0:
+                n_top = min(args.ground_top, n_all)
             else:
-                log("  ground motion: ground region too small; averaging unaligned frames")
-        else:
-            log("  ground motion: no usable ground region; averaging unaligned frames")
-
-    ground_store = None
-    ground_path = None
-    ground_kept = 0
-    if (args.composite and args.ground_method == "median" and not args.ground_dir
-            and ground_bbox is not None):
-        gy0, gy1, gx0, gx1 = ground_bbox
-        ground_path = os.path.join(args.out, "_ground_uint16.dat")
-        ground_store = stacking.make_median_store(
-            ground_path, len(files), gy1 - gy0, gx1 - gx0)
-        log(f"  ground median store: {gx1-gx0}x{gy1-gy0} px, {len(files)} frames")
+                n_top = min(n_all, max(3, int(round(0.05 * n_all))))
+            scores = np.array(
+                [float(cleaned[k][gm_half].mean()) for k in range(n_all)],
+                np.float32)
+            order = np.argsort(scores)[::-1][:n_top]
+            ground_keep = np.zeros(n_all, bool)
+            ground_keep[order] = True
+            chosen = ", ".join(f"IMG_{files[k][0]}" for k in sorted(order))
+            log(f"  ground selection: {n_top}/{n_all} brightest frames ({chosen})")
 
     acc_sum = None
     acc_w = np.zeros((H, W), np.float32)
     ones = np.ones((H, W), np.float32)
-    ground_acc = (np.zeros((H, W, 3), np.float32)
-                  if args.composite and ground_store is None else None)
-    ground_n = 0
     # Temporal-motion accumulator (half-res) for the sky/ground boundary: the
     # raw frames vary over the sky (the stars move) and are static over the
     # ground, so their variance is a clean sky cue even near the celestial pole.
@@ -321,6 +656,52 @@ def run(args):
     finally:
         cv2.setNumThreads(prev_threads)
     mark("registration", t)
+
+    # Mount decision from the registration itself -- the robust test.  If the
+    # stars barely needed aligning (small median displacement), the camera rode
+    # a sky-tracking mount, so the *ground* sweeps across the frames and the
+    # ground layer must be translation-aligned.  If the stars move a lot, it is
+    # a fixed tripod: the ground is static and frames stack unaligned.
+    dnorm = [float(np.hypot(r["tx"], r["ty"])) for r in reg_results
+             if r["ok"] and r["idx"] != ref_id]
+    star_disp = float(np.median(dnorm)) if dnorm else None
+    stars_tracked = tracked
+    if star_disp is not None:
+        stars_tracked = star_disp < STAR_TRACK_MAX_PX
+        log(f"  star motion vs reference: median {star_disp:.1f} px over "
+            f"{len(dnorm)} frames -> "
+            + ("sky-tracked mount: ground must be aligned" if stars_tracked
+               else "fixed tripod: ground is static"))
+    if stars_tracked and not args.hot_post:
+        args.hot_post = True
+        log("  tracked sequence: enabling --hot-post (fixed sensor hot pixels "
+            "are not rejected by a median of static stars)")
+
+    # Ground alignment plan: per-frame full-res warps for the ground layer
+    # (homography on tracked rigs, see _plan_ground_motion).  May narrow
+    # ground_keep to a lit cluster, so the median store is sized after this.
+    ground_shift = None
+    ground_M = [None] * len(files)
+    ground_static = True
+    if args.composite and not args.ground_dir:
+        ground_shift, ground_M, ground_static, ground_keep = _plan_ground_motion(
+            args, files, cleaned, ground_mask_img, ground_bbox, gw, gh,
+            stars_tracked, ground_keep)
+
+    ground_store = None
+    ground_path = None
+    ground_kept = 0
+    n_ground = int(ground_keep.sum()) if ground_keep is not None else len(files)
+    if (args.composite and args.ground_method == "median" and not args.ground_dir
+            and ground_bbox is not None):
+        gy0, gy1, gx0, gx1 = ground_bbox
+        ground_path = os.path.join(args.out, "_ground_uint16.dat")
+        ground_store = stacking.make_median_store(
+            ground_path, n_ground, gy1 - gy0, gx1 - gx0)
+        log(f"  ground median store: {gx1-gx0}x{gy1-gy0} px, {n_ground} frames")
+    ground_acc = (np.zeros((H, W, 3), np.float32)
+                  if args.composite and ground_store is None else None)
+    ground_n = 0
 
     io_pool = (ThreadPoolExecutor(max_workers=io_workers)
                if io_workers > 1 else None)
@@ -395,15 +776,22 @@ def run(args):
             median_store[kept] = np.clip(warped * 65535.0, 0, 65535).astype(np.uint16)
             kept += 1
 
-        if ground_acc is not None or ground_store is not None:
+        use_ground = ground_keep is None or ground_keep[k]
+        if (ground_acc is not None or ground_store is not None) and use_ground:
             glin = lin
-            if tracked and not ground_static:
-                dx, dy = ground_shift[k]
-                if ground_resp[k] >= 0.005:
-                    gm = np.float32([[1, 0, dx * 2], [0, 1, dy * 2]])
-                    glin = cv2.warpAffine(
-                        lin, gm, (W, H), flags=cv2.INTER_LINEAR,
+            if not ground_static:
+                Mf = ground_M[k]
+                if Mf is not None:
+                    glin = cv2.warpPerspective(
+                        lin, Mf, (W, H), flags=cv2.INTER_LINEAR,
                         borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+                elif ground_shift is not None:
+                    dx, dy = ground_shift[k]
+                    if np.isfinite([dx, dy]).all():
+                        gm = np.float32([[1, 0, dx * 2], [0, 1, dy * 2]])
+                        glin = cv2.warpAffine(
+                            lin, gm, (W, H), flags=cv2.INTER_LINEAR,
+                            borderMode=cv2.BORDER_CONSTANT, borderValue=0)
             if ground_store is not None:
                 gy0, gy1, gx0, gx1 = ground_bbox
                 ground_store[ground_kept] = np.clip(
@@ -476,56 +864,20 @@ def run(args):
     # the detected sky-ground boundary.  For tracked sequences the ground is
     # translation-aligned first; for static tripod sequences every frame is
     # already aligned.  This replaces the linear master that later steps use.
-    sky_mask = None
+    composite_late = (args.composite and
+                      getattr(args, "composite_stage", "early") == "late")
     t = time.perf_counter()
-    if args.composite:
-        if args.ground_dir:
-            ground = _stack_ground_from_dir(args)
-            if ground is None:
-                log("  !! composite: no ground frames found; using the input frames")
-                ground = stacking.mean_ground(ground_acc, ground_n)
-        elif ground_store is not None:
-            gy0, gy1, gx0, gx1 = ground_bbox
-            log(f"  ground layer: median of {ground_kept} frames "
-                f"({gx1-gx0}x{gy1-gy0} px, "
-                f"{'static foreground' if ground_static else 'translation-aligned'})")
-            ground = master.copy()
-            gcrop = stacking.median_stack(
-                ground_store[:ground_kept], gy1 - gy0, gx1 - gx0,
-                workers=stack_workers, band_mb=stack_band_mb)
-            if ground_mask_img is not None:
-                gm = ground_mask_img[gy0:gy1, gx0:gx1] > 127
-                dst = ground[gy0:gy1, gx0:gx1]
-                dst[gm] = gcrop[gm]
-            else:
-                ground[gy0:gy1, gx0:gx1] = gcrop
-            ground_n = ground_kept
-        else:
-            log(f"  ground layer: mean of {ground_n} frames "
-                f"({'static foreground' if ground_static else 'translation-aligned'})")
-            ground = stacking.mean_ground(ground_acc, ground_n)
+    if args.composite and not composite_late:
+        ground = _build_ground_layer(args, ground_mask_img, master, ground_store,
+                                     ground_bbox, ground_kept, ground_acc,
+                                     ground_n, ground_static, stack_workers,
+                                     stack_band_mb)
         sigma = max(8.0, 0.01 * gw)
         evidence = horizon.sky_evidence(
             horizon.variance(var_sum, var_sq, var_n), sigma)
         if os.environ.get("ASTRO_DEBUG_VAR"):
             np.savez(os.path.join(args.out, "_dbg_var.npz"),
                      var_sum=var_sum, var_sq=var_sq, var_n=var_n)
-        # A boundary recognised by a large image model can be supplied as a
-        # ground mask (white = ground); it overrides the variance detection.
-        sky_mask = None
-        if args.ground_mask:
-            gm = ground_mask_img
-            if gm is None:
-                log(f"  !! composite: cannot read --ground-mask "
-                    f"{args.ground_mask}; falling back to auto detection")
-            else:
-                gm = cv2.resize(gm, (W, H), interpolation=cv2.INTER_LINEAR)
-                sky = 1.0 - gm.astype(np.float32) / 255.0
-                sky = cv2.GaussianBlur(sky, (0, 0),
-                                       max(1.0, args.composite_feather))
-                sky_mask = np.clip(sky, 0, 1).astype(np.float32)
-                log(f"  ground mask (model): {args.ground_mask}  "
-                    f"ground={100.0 * (gm > 127).mean():.1f}%")
         comp, info = composite_step.run_composite(
             master, ground, evidence, args.out, target_bg=args.stretch_bg,
             mode=args.composite_horizon, feather=args.composite_feather,
@@ -533,9 +885,7 @@ def run(args):
         if comp is not None:
             add_stage("composite", comp, linear=True)
             master = comp
-        linear = master
-    else:
-        linear = master
+    linear = master
     mark("composite", t)
 
     # stage: auto flat (ABE) -- fit and subtract the smooth per-channel
@@ -564,7 +914,8 @@ def run(args):
 
     # stage: adaptive brightness stretch (auto MTF), so faint structure shows
     t = time.perf_counter()
-    ys, mtf_m, bg = stretch.auto_stretch(linear, target_bg=args.stretch_bg)
+    ys, mtf_m, bg, sparams = stretch.auto_stretch(
+        linear, target_bg=args.stretch_bg, return_params=True)
     add_stage("stretched", ys)
     mark("stretch", t)
 
@@ -572,8 +923,10 @@ def run(args):
     # background becomes a neutral grey (PixInsight BackgroundNeutralization).
     if args.neutralize:
         t = time.perf_counter()
-        ys, sref, sgain = neutralize.background_neutralize(ys)
-        log(f"  neutralized background: ref={np.round(sref, 4).tolist()} "
+        ys, sref, sgain = neutralize.background_neutralize(
+            ys, sky_mask=sky_mask, strength=args.neutralize_strength)
+        log(f"  neutralized background{' (sky only)' if sky_mask is not None else ''}: "
+            f"ref={np.round(sref, 4).tolist()} "
             f"gains={np.round(sgain, 4).tolist()}")
         add_stage("neutralized", ys)
         mark("neutralize", t)
@@ -616,6 +969,52 @@ def run(args):
             f"(mask {100.0 * (star_mask > 0.05).mean():.2f}% of frame)")
         add_stage("star_reduced", ys)
         mark("star_reduce", t)
+
+    # ---- late composite: the sky ran the whole chain first (flat / stretch /
+    # neutralize / white balance / star reduction all measured on PURE sky, no
+    # foreground contamination); stretch the ground with the sky's curve and
+    # stitch at the very end.  Needs --ground-mask for the boundary.
+    if composite_late:
+        t = time.perf_counter()
+        ground = _build_ground_layer(args, ground_mask_img, master, ground_store,
+                                     ground_bbox, ground_kept, ground_acc,
+                                     ground_n, ground_static, stack_workers,
+                                     stack_band_mb)
+        ygr = stretch.apply_stretch(ground, sparams)
+        if sky_mask is None:
+            sky_mask = np.ones((H, W), np.float32)
+            sky_mask[int(H * 0.65):] = 0.0
+            sky_mask = cv2.GaussianBlur(sky_mask, (0, 0),
+                                        max(1.0, args.composite_feather))
+            log("  late composite: no --ground-mask, straight bottom-line "
+                "boundary (the variance horizon cannot be used after stretching)")
+        imgio.write_tiff16(os.path.join(args.out, "ground_stack.tif"),
+                           np.clip(ground * 65535.0, 0, 65535).astype(np.uint16))
+        gp = cv2.resize((np.clip(ygr, 0, 1) * 255 + 0.5).astype(np.uint8),
+                        None, fx=0.5, fy=0.5, interpolation=cv2.INTER_AREA)
+        cv2.imwrite(os.path.join(args.out, "ground_stack_preview.jpg"),
+                    cv2.cvtColor(gp, cv2.COLOR_RGB2BGR),
+                    [cv2.IMWRITE_JPEG_QUALITY, 92])
+        ys = composite_step.compose(ys, ygr, sky_mask)
+        cv2.imwrite(os.path.join(args.out, "sky_mask.png"),
+                    (np.clip(sky_mask, 0, 1) * 255).astype(np.uint8))
+        disp = cv2.resize((np.clip(ys, 0, 1) * 255 + 0.5).astype(np.uint8),
+                          None, fx=0.5, fy=0.5, interpolation=cv2.INTER_AREA)
+        half = cv2.resize(sky_mask, (disp.shape[1], disp.shape[0]),
+                          interpolation=cv2.INTER_AREA)
+        cnts, _ = cv2.findContours((half > 0.5).astype(np.uint8),
+                                   cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        cv2.drawContours(disp, cnts, -1, (0, 200, 255), 2)
+        cv2.putText(disp, "sky / ground boundary (late composite)", (15, 40),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 2)
+        cv2.imwrite(os.path.join(args.out, "sky_ground_overlay.jpg"),
+                    cv2.cvtColor(disp, cv2.COLOR_RGB2BGR),
+                    [cv2.IMWRITE_JPEG_QUALITY, 88])
+        log(f"  late composite: sky {100.0 * sky_mask.mean():.1f}% / "
+            f"ground {100.0 * (1.0 - sky_mask.mean()):.1f}%  "
+            f"(feather {args.composite_feather:g}px)")
+        add_stage("composite", ys)
+        mark("composite_late", t)
 
     # ---- every stage as its own TIFF + preview, plus a comparison montage ----
     log("  writing per-stage images ...")

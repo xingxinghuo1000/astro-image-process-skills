@@ -25,7 +25,7 @@
 | **星空配准** | ORB 特征匹配 + 星点质心精修，拟合**单应变换**（旋转天空的正确模型 `K R K^-1`），并用匹配分、内点数、星点残差做合理性校验，剔除坏帧。支持 `--workers` 多线程逐帧并行。 |
 | **叠加** | 分块**中值**（推荐）或加权**均值**；中值用磁盘 memmap，长序列也不会爆内存，并按行带并行计算（`--stack-workers`）。 |
 | **热噪点去除** | 单帧、逐通道检测彩色热噪点（被单一通道支配的孤立局部极大），做"美化式"修复并输出前后对比图。`--hot-pre`（逐原始帧）或 `--hot-post`（叠加后）。 |
-| **天地合成** | 在天地分界线处，把「对齐到星空的天景」和「多帧叠加的静态地景层」拼接（默认中值，可用 `--ground-method mean` 保留光绘）。分界线可由**大模型识图**给出（推荐），或用时间方差自动检测。 |
+| **天地合成** | 在天地分界线处，把「对齐到星空的天景」和「静态地景层」拼接。地景层默认取**最亮的 5% 帧**（手电/光绘通常只出现在少数帧），避免对全序列取中值后地景变黑、细节丢失；可用 `--ground-top` 调整帧数、`--ground-top -1` 用全部帧。分界线可由**大模型识图**给出（推荐），或用时间方差自动检测。 |
 | **自动平场（ABE）** | 在**线性图**上做类 PixInsight `AutomaticBackgroundExtractor` 的二维多项式背景拟合，可减可除，带强度混合与多强度对比。 |
 | **自动拉伸** | 自适应 MTF 拉伸，把天空背景放到目标亮度。 |
 | **背景中性化** | 逐通道缩放，把天空背景校正为中性灰（消除光害导致的偏色）。 |
@@ -194,8 +194,9 @@ align_stack.py
   --composite              开启
   --ground-mask PATH       大模型识别的地景掩膜（白 = 地景）
   --ground-method {mean,median}   地景合成方式（默认 median）
+  --ground-top N           只用最亮的 N 帧地景（默认 5%，至少 3 帧；-1 = 全部帧）
   --composite-horizon {mask,line}
-  --composite-thresh 0.05 --composite-feather 25
+  --composite-thresh 0.05 --composite-feather 8
   --ground-dir DIR --ground-start N --ground-end N   用另一组地景序列
 ```
 
@@ -252,8 +253,11 @@ align_stack.py
 看 `out/sky_ground_overlay.jpg` 检查：分界线（青色）应紧贴前景轮廓，天空里不应出现星轨。
 最终成品是 `out/merge_final_5994_6012.tif/.jpg`。
 
-> 天地合成要求**前景静止**。地景层默认对所有入选帧做中值叠加；星空跟踪序列会先测量地景位移，
-> 位移明显时做平移对齐。`--ground-method mean` 可改为均值以保留光绘。
+> 天地合成要求**前景静止**（固定三脚架）。地景层默认取**最亮的 5% 入选帧**做中值叠加，避免手电/光绘只出现在
+> 少数帧时，全序列中值把地景压黑、细节丢光；`--ground-method mean` 可改为均值以保留更多光绘，
+> `--ground-top N` 可指定帧数（`-1` = 全部帧）。星空跟踪（赤道仪）序列的地景在画面里是运动的，
+> 会先由星点位移判定设备，再对地景做**逐帧单应对齐**（8 块相位相关拟合单应 + 手电亮帧簇；纯平移会"中间齐、
+> 四周不齐"，广角镜头边缘残差可达数十像素）——见 `ground_align.json` / `ground_align_compare.jpg`。
 > 如果有单独拍的地景帧，用 `--ground-dir`（见场景 6）。
 
 **4. 只想去光害梯度——先比较平场强度**
@@ -303,9 +307,10 @@ align_stack.py
    开启 `--hot-pre` 时，在这里对每张全分辨率帧先修热噪点。
 3. **叠加** — 对齐后的帧用**分块中值**（memmap，行带并行）或加权均值合成 → `stage1_stacked`。
 4. **热噪点修复**（`--hot-post`）— 在叠加主图上逐通道检测并美化修复 → `stage2_hotfix`。
-5. **天地合成**（`--composite`）— 构建地景层（默认中值叠加 124 帧；`--ground-method mean`
-   改为均值以保留光绘），取得天地分界线（大模型 `--ground-mask` 或时间方差自动检测），
-   用羽化掩膜融合两层 → `stageN_composite`。它成为后续所有步骤所操作的线性主图。
+5. **天地合成**（`--composite`）— 构建地景层（默认取最亮的 5% 帧做中值叠加；
+   `--ground-method mean` 改为均值以保留更多光绘，`--ground-top` 指定帧数），取得天地分界线
+   （大模型 `--ground-mask` 或时间方差自动检测），用羽化掩膜融合两层 →
+   `stageN_composite`。它成为后续所有步骤所操作的线性主图。
 6. **自动平场 / ABE**（`--flat`）— 在**线性图**上拟合平滑的逐通道二维背景并减去/除去，
    按 `--flat-strength` 混合 → `stageN_flat`。同时写 `flat_compare.jpg` 供目视决策。
 7. **自动拉伸**（始终）— 自适应 MTF，把背景拉到目标亮度 → `stageN_stretched`。
@@ -333,7 +338,7 @@ align_stack.py
 | `hot_metrics.json`、`hot_compare_pre.jpg`、`hot_compare_post.jpg` | 热噪点审计与前后对比图。 |
 | `flat_compare.jpg` | 不平场 vs 平场（用 `--flat-sweep` 时还会平铺多个强度）。 |
 | `wb_compare.jpg` | 白平衡前/后对比图，标注实际增益（`--wb` 时）。 |
-| `ground_stack.tif` + `_preview.jpg` | 静态地景层（`--composite` 时）。 |
+| `ground_stack.tif` + `_preview.jpg` | 静态地景层（`--composite` 时）：默认取最亮 5% 帧，`--ground-top` 可调。 |
 | `sky_mask.png`、`sky_ground_overlay.jpg` | 天地合成掩膜与检查用叠加图（`--composite` 时）。 |
 | `star_mask.png` | 星点掩膜（缩星时）。 |
 | `aligned/IMG_<n>.tif` | 每帧对齐结果（`--save-frames` 时）。 |
@@ -345,7 +350,7 @@ align_stack.py
 - **优先用中值。** 星野序列用 `--method median`；`mean` 只留给特殊情形。
 - **平场亮环。** 对银河铺满的画面做满强度 ABE，可能把中心压暗、边缘留一圈亮环——把
   `--flat-strength` 降到 ~0.3–0.6。
-- **天地合成需要静止前景。** 地景层默认由所有入选帧中值叠加；跟踪序列会先做地景平移对齐。
+- **天地合成需要静止前景。** 地景层默认取最亮的 5% 入选帧做中值叠加；跟踪（赤道仪）序列由星点位移判定后，对地景做逐帧**单应**对齐（亮帧簇内）——地景层锚定在簇中点，**换了所选簇要按新的 `ground_stack_preview.jpg` 重画地景掩膜**。
 - **地景掩膜极性。** `--ground-mask` 要求灰度图**白色 = 地景/前景**、黑色 = 天空；
   边缘会按 `--composite-feather` 羽化。
 - 默认的 `--dir/--start/--end` 指向示例序列，请替换为你自己的数据。

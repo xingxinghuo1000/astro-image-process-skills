@@ -26,7 +26,7 @@ foreground sharp.
 | **Sky registration** | ORB feature matching + star-centroid refinement, fitting a projective **homography** per frame (the correct model for a rotating sky: `K R K^-1`), with plausibility checks (match score, inliers, star residual) that reject bad frames. Frames register in parallel with `--workers` (default: one per CPU core). |
 | **Stacking** | Block-wise **median** (recommended) or weighted **mean**; median uses an on-disk memmap so long sequences fit in RAM, and independent row bands are processed in parallel (`--stack-workers`). |
 | **Hot-pixel removal** | Per-channel, single-frame detection of colored hot pixels (isolated local maxima dominated by one channel), with cosmetic repair and before/after figures. `--hot-pre` (per raw frame) or `--hot-post` (stacked). |
-| **Sky/ground composite** | Stitches the star-aligned sky onto a static (un-registered) ground layer at the sky/ground boundary. The boundary can be recognised by a **large vision model** (recommended) or detected automatically from temporal variance. |
+| **Sky/ground composite** | Stitches the star-aligned sky onto a sharp ground layer at the sky/ground boundary. Fixed tripod: the ground is static, the layer is a median of the **brightest 5% of frames** (light painting is usually transient). Sky-tracked (equatorial mount): the ground sweeps across the frames, and the apparent motion is a camera rotation — a **per-frame homography** (fit from 8 block phase-correlations, flashlight-lit frame cluster only) aligns it; a plain translation aligns only the centre and ghosts the wide-angle edges. The boundary can be recognised by a **large vision model** (recommended) or detected automatically from temporal variance. |
 | **Auto flat (ABE)** | PixInsight `AutomaticBackgroundExtractor`-style 2D polynomial background fit on the **linear** image, subtract/divide, with a blend strength and a strength sweep. |
 | **Auto stretch** | Adaptive mid-tone-transfer (MTF) stretch that places the sky background at a target level. |
 | **Background neutralization** | Per-channel scaling so the sky background becomes neutral grey (removes light-pollution color casts). |
@@ -201,8 +201,10 @@ Sky/ground composite (天地合成)
   --composite              enable
   --ground-mask PATH       ground mask from a large vision model (white = ground)
   --ground-method {mean,median}   ground combiner (default: median)
+  --ground-top N           use the N brightest ground frames (default: 5%, min 3;
+                           -1 = all frames)
   --composite-horizon {mask,line}
-  --composite-thresh 0.05 --composite-feather 25
+  --composite-thresh 0.05 --composite-feather 8
   --ground-dir DIR --ground-start N --ground-end N   ground from another sequence
 ```
 
@@ -265,9 +267,12 @@ Check `out/sky_ground_overlay.jpg`: the boundary is drawn in cyan and should hug
 the foreground; the sky must be free of star trails. The final image is
 `out/merge_final_5994_6012.tif/.jpg`.
 
-> The composite needs a **static foreground**. The ground layer is stacked from
-> all accepted frames (median by default; `--ground-method mean` keeps light
-> painting). On a sky-tracked sequence the ground is translation-aligned first
+> The composite needs a **static foreground**. By default the ground layer is
+> stacked from the **brightest 5% of accepted frames** (median; `--ground-method
+> mean` keeps more light painting). This avoids the dark, detail-free foreground
+> produced when a flashlight or light painting appears in only a few frames.
+> Use `--ground-top N` to choose a different count, or `--ground-top -1` to use
+> every frame. On a sky-tracked sequence the ground is translation-aligned only
 > when the measured motion is significant. With dedicated foreground frames,
 > use `--ground-dir` (scenario 6).
 
@@ -329,11 +334,12 @@ Optional steps are added to the stage list only when their flag is set, and the
    (memmap-backed) or a weighted mean → `stage1_stacked`.
 4. **Hot-pixel repair** (`--hot-post`) — per-channel detection on the stacked
    master and cosmetic repair → `stage2_hotfix`.
-5. **Sky/ground composite** (`--composite`) — build a temporal ground layer
-   (median by default; `--ground-method mean` keeps light painting), get the
-   sky/ground boundary (large-model `--ground-mask` or temporal-variance
-   detection), and blend the two layers with a feathered mask →
-   `stageN_composite`. This becomes the linear master for later steps.
+5. **Sky/ground composite** (`--composite`) — build a ground layer from the
+   **brightest 5% of frames** (median by default; `--ground-method mean` keeps
+   more light painting; `--ground-top` overrides the count), get the sky/ground
+   boundary (large-model `--ground-mask` or temporal-variance detection), and
+   blend the two layers with a feathered mask → `stageN_composite`. This becomes
+   the linear master for later steps.
 6. **Auto flat / ABE** (`--flat`) — fit a smooth per-channel 2D background on the
    **linear** image and subtract/divide it, blended by `--flat-strength` →
    `stageN_flat`. Writes `flat_compare.jpg` for a visual decision.
@@ -367,7 +373,7 @@ Optional steps are added to the stage list only when their flag is set, and the
 | `hot_metrics.json`, `hot_compare_pre.jpg`, `hot_compare_post.jpg` | Hot-pixel audit and before/after figures. |
 | `flat_compare.jpg` | No-flat vs flat (and a strength sweep when `--flat-sweep` is used). |
 | `wb_compare.jpg` | Before vs after white balance, labelled with the applied gains. |
-| `ground_stack.tif` + `_preview.jpg` | Static ground layer (with `--composite`). |
+| `ground_stack.tif` + `_preview.jpg` | Static ground layer (with `--composite`): brightest 5% by default; `--ground-top` controls the count. |
 | `sky_mask.png`, `sky_ground_overlay.jpg` | Composite mask and inspection overlay (with `--composite`). |
 | `star_mask.png` | Star mask (when star reduction runs). |
 | `aligned/IMG_<n>.tif` | Each aligned frame (with `--save-frames`). |
@@ -382,8 +388,8 @@ Optional steps are added to the stage list only when their flag is set, and the
   carve the centre and leave a bright border ring — lower `--flat-strength` to
   ~0.3–0.6.
 - **Composite requires a static foreground.** On a fixed tripod the ground layer
-  comes from the plain (un-registered) average; on a sky-tracked rig it uses the
-  reference frame only, because the foreground moves with the tracker.
+  comes from the plain (un-registered) selected frames; on a sky-tracked rig it
+  is translation-aligned when the measured ground motion is significant.
 - **Ground-mask polarity.** `--ground-mask` expects a grayscale image where
   **white = ground/foreground** and black = sky. Edges are feathered by
   `--composite-feather`.

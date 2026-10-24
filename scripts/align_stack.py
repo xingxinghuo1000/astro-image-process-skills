@@ -85,7 +85,13 @@ def build_parser():
                          "(higher = brighter; default 0.20)")
     ap.add_argument("--neutralize", action="store_true",
                     help="neutralize the sky background to a grey after "
-                         "stretching (PixInsight BackgroundNeutralization style)")
+                         "stretching (PixInsight BackgroundNeutralization "
+                         "style); with --ground-mask the measurement and the "
+                         "correction are restricted to the sky")
+    ap.add_argument("--neutralize-strength", type=float, default=1.0, metavar="S",
+                    help="blend the neutralization gains in log space, 0..1 "
+                         "(default 1.0 = full; 0.4-0.6 is gentler on strong "
+                         "aurora / airglow scenes)")
     ap.add_argument("--star-reduce", type=float, default=1.0, metavar="PX",
                     help="shrink stars by PX pixels with a morphology + star-mask "
                          "step applied to the stretched image (PixInsight "
@@ -165,12 +171,24 @@ def build_parser():
                    help="stitch the star-aligned sky onto a temporally stacked "
                         "ground layer, split at the detected sky-ground boundary "
                         "('天地分界线')")
+    c.add_argument("--composite-stage", choices=["early", "late"],
+                   default="late",
+                   help="'late' (default): the sky runs the whole chain first "
+                        "(flat / stretch / neutralize / white balance / star "
+                        "reduction measured on pure sky), the ground is "
+                        "stretched with the sky's curve and stitched last -- "
+                        "sky stats uncontaminated by the foreground, and the "
+                        "ground layer (ground_stack.tif) stays a separate, "
+                        "re-adjustable product you can re-grade and re-stitch "
+                        "without rerunning the chain; needs --ground-mask. "
+                        "'early': stitch in the linear domain (legacy), all "
+                        "post-processing acts on the composite")
     c.add_argument("--composite-horizon", choices=["mask", "line"], default="mask",
                    help="'mask' follows a ragged tree/terrain line (default); "
                         "'line' forces a robust straight horizon fit")
-    c.add_argument("--composite-feather", type=float, default=25.0, metavar="PX",
+    c.add_argument("--composite-feather", type=float, default=8.0, metavar="PX",
                    help="width (full-res px) of the blend band across the boundary "
-                        "(default 25)")
+                        "(default 8)")
     c.add_argument("--composite-thresh", type=float, default=0.05, metavar="T",
                    help="sky-evidence threshold (fraction of the 99.5th percentile); "
                         "raise it to pull the boundary up, lower it to include "
@@ -183,6 +201,9 @@ def build_parser():
                    help="combine the ground layer: median (default) rejects "
                         "transient flashlight/people and hot pixels; mean keeps "
                         "light painting")
+    c.add_argument("--ground-top", type=int, default=0, metavar="N",
+                   help="use only the N brightest ground frames (default: 5%% "
+                        "of the frames, at least 3; -1 = all frames)")
     c.add_argument("--ground-dir", default="",
                    help="use a separate foreground sequence for the ground layer "
                         "(default: the input frames, un-registered)")

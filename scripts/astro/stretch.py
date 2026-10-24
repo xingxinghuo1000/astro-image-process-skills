@@ -7,11 +7,14 @@ def _mtf(m, x):
     return ((m - 1.0) * x) / ((2.0 * m - 1.0) * x - m)
 
 
-def auto_stretch(rgb_lin, target_bg=0.20, black_pct=0.3, white_pct=99.95):
+def auto_stretch(rgb_lin, target_bg=0.20, black_pct=0.3, white_pct=99.95,
+                 return_params=False):
     """Adaptive stretch: robust per-channel black point, normalize by a high
     percentile, then pick the midtone-transfer parameter so the sky background
     lands at `target_bg` -- lifts the faint Milky Way without blowing stars.
-    Returns (stretched_rgb, mtf_m, background_level)."""
+    Returns (stretched_rgb, mtf_m, background_level); with return_params also
+    returns the curve so the SAME mapping can be applied to a ground layer
+    (late composite: the ground must sit at the same brightness as the sky)."""
     x = np.clip(rgb_lin, 0, None)
     blk = np.percentile(x, black_pct, axis=(0, 1))
     x = np.clip(x - blk, 0, None)
@@ -27,7 +30,18 @@ def auto_stretch(rgb_lin, target_bg=0.20, black_pct=0.3, white_pct=99.95):
             hi = mid
     m = 0.5 * (lo + hi)
     y = _mtf(m, np.clip(xn, 0, 1))
-    return np.clip(y, 0, 1), m, bg
+    y = np.clip(y, 0, 1)
+    if return_params:
+        return y, m, bg, dict(blk=blk, wht=wht, m=m)
+    return y, m, bg
+
+
+def apply_stretch(rgb_lin, p):
+    """Apply a previously measured auto_stretch curve (its params dict)."""
+    x = np.clip(rgb_lin, 0, None)
+    x = np.clip(x - p["blk"], 0, None)
+    xn = x / p["wht"] if p["wht"] > 0 else x
+    return np.clip(_mtf(p["m"], np.clip(xn, 0, 1)), 0, 1)
 
 
 def stretch_preview(rgb_lin, gain=50.0):
