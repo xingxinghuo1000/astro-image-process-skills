@@ -163,7 +163,7 @@ align_stack.py
   --method {mean,median}   叠加方式（默认 median；不推荐 mean）
   --exclude 6007,6012      剔除指定帧
   --workers N              逐帧配准并行线程数（默认 0 = 自动）
-  --io-workers N           CR2 解码并行线程数（默认 0 = 自动，上限 16）
+  --io-workers N           CR2 解码并行线程数（默认 0 = 自动，上限 8）
   --stack-workers N        中值叠加行带并行线程数（默认 0 = 自动）
   --stack-band-mb MB       每个中值行带的目标工作集（默认 0 = 16 MB）
   --render-workers N       各阶段 TIFF/JPEG 并行写出（默认 0 = 自动，上限 8）

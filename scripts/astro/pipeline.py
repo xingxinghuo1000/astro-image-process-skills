@@ -133,6 +133,13 @@ def _plan_ground_motion(args, files, cleaned, ground_mask_img, ground_bbox,
     if ground_mask_img is not None:
         gm_half = cv2.resize((ground_mask_img > 127).astype(np.uint8),
                              (gw, gh), interpolation=cv2.INTER_NEAREST) > 0
+        # Correlation blocks weigh ground texture INCLUDING the fade band
+        # above the composite mask line: fog over the foreground is scene
+        # content that moves with it, and zero-weighting it starves the top
+        # block row (01: head window fits dropped to 1, every homography
+        # rejected).  The composite mask keeps its fade-free line.
+        upm = np.roll(gm_half, -175, axis=0); upm[-175:] = False
+        gm_half |= upm
         gw_half = np.ascontiguousarray(
             gm_half[hy0:hy1, hx0:hx1].astype(np.float32))
         gw_half = cv2.erode(gw_half, np.ones((5, 5), np.uint8))
@@ -157,91 +164,133 @@ def _plan_ground_motion(args, files, cleaned, ground_mask_img, ground_bbox,
     # that fixed pattern, so subtract it and correlate only the residual.
     fixed = np.median(crops, axis=0)
     # Ground texture (flashlight-lit grass) exists in only a few frames, and
-    # the sky reference frame is often a pitch-black silhouette.  Correlate
-    # every frame against the BRIGHTEST ground frame, keep the
-    # high-response (lit) measurements.
-    gref = int(np.argmax((crops * wm).mean(axis=(1, 2))))
-    ref_ground = (crops[gref] - fixed) * win
-    idxs, shs = [], []
-    for k in range(n):
-        if k == gref:
-            idxs.append(k)
-            shs.append((0.0, 0.0))
-            continue
-        mov = (crops[k] - fixed) * win
-        try:
-            (dx, dy), resp = cv2.phaseCorrelate(mov, ref_ground, None)
-        except cv2.error:
-            continue
-        if np.isfinite([dx, dy, resp]).all() and resp >= 0.05:
-            idxs.append(k)
-            shs.append((dx, dy))
-    # Top-brightness frames are also cluster candidates: a flashlight beam
-    # that sweeps exposes a LIT PATCH that changed between clusters, so the
-    # correlation response between e.g. a 10-frame window and a later
-    # 3-frame window is meaningless and gate-rejects the bright window --
-    # yet within that bright window adjacent frames correlate strongly and
-    # its ground is the one the composite wants (grass lit, detail visible).
-    if ground_keep is not None:
-        for k in np.flatnonzero(ground_keep):
-            k = int(k)
+    # the sky reference frame is often a pitch-black silhouette.  Each
+    # candidate flashlight window gets its own reference frame and its own
+    # correlation pass: a beam that sweeps exposes a LIT PATCH that changed
+    # between windows, so cross-window correlation is meaningless (measured
+    # response <0.05), and a window whose blocks are too dark to fit must
+    # hand selection to the next window (01: the stones-lit tail window fits
+    # no homography; the arc fallback smeared).
+    # Candidate windows: top-brightness frames UNION lit-increment frames
+    # (positive energy over the pixel-wise temporal median -- the flashlight
+    # signature proper: 01's horizon-lit head window ranks below the
+    # stones-lit tail in ground-mean brightness because its light lives in
+    # the fog band the composite mask excludes, but its lit increment is
+    # huge; sky glow cancels in the median subtraction).
+    # Cluster score = sqrt(n) x brightness clipped at the 99.5th ground
+    # percentile: a narrow direct beam blows highlights (area x P), a broad
+    # grass-lit window wins the clipped mean (SKILL: direct needs >1.8x to
+    # flip -- the unclipped mean lets a blown window win on highlights).
+    pos = np.clip((crops - fixed) * wm[None], 0.0, None)
+    allv = (crops * wm)[:, wm > 0][:, ::20].ravel()
+    P = float(np.percentile(allv, 99.5)) if allv.size else 0.0
+    bright = np.array([float((np.clip(crops[k], 0, max(P, 1e-6)) * wm).sum()
+                              / max(wm.sum(), 1.0)) for k in range(n)])
+    e = pos.reshape(n, -1).sum(axis=1)
+    emed = float(np.median(e))
+    top_frames = ([int(k) for k in np.flatnonzero(ground_keep)]
+                  if ground_keep is not None else [])
+    cand = sorted(set(top_frames)
+                  | set(int(k) for k in np.flatnonzero(e > 1.6 * emed + 1e-9)))
+    groups = []
+    for k in cand:
+        if groups and k - groups[-1][-1] <= 4:
+            groups[-1].append(k)
+        else:
+            groups.append([k])
+    gref = int(np.argmax(bright))
+    refs = sorted({max(g, key=lambda gk: bright[gk]) for g in groups} | {gref},
+                  key=lambda gk: -bright[gk])
+    arc = None
+    for gref_r in refs:
+        ref_ground = (crops[gref_r] - fixed) * win
+        idxs, shs = [], []
+        for k in range(n):
+            if k == gref_r:
+                idxs.append(k)
+                shs.append((0.0, 0.0))
+                continue
+            mov = (crops[k] - fixed) * win
+            try:
+                (dx, dy), resp = cv2.phaseCorrelate(mov, ref_ground, None)
+            except cv2.error:
+                continue
+            if np.isfinite([dx, dy, resp]).all() and resp >= 0.05:
+                idxs.append(k)
+                shs.append((dx, dy))
+        for k in top_frames:
             if k not in idxs:
                 idxs.append(k)
                 shs.append((float("nan"), float("nan")))
         idxs.sort()
-    if len(idxs) < 3:
-        log("  ground motion: no textured (lit) ground frames to correlate; "
-            "foreground is a silhouette -> stacking unaligned")
-        return ground_shift, ground_M, ground_static, ground_keep
-
-    idxs_f = np.asarray(idxs, np.float64)
-    shs_f = np.asarray(shs, np.float64)
-    # The arc-fit fallback uses only frames with a real displacement
-    # measurement; top-brightness candidates carry NaN shifts (no response).
-    meas = np.isfinite(shs_f).all(axis=1)
-    kk = np.arange(n, dtype=np.float64)
-    if meas.sum() >= 3:
-        pred = np.stack([np.polyval(np.polyfit(idxs_f[meas], shs_f[meas][:, a], 1), kk)
-                         for a in (0, 1)], axis=1)
-        shift = (pred - pred[int(np.median(idxs_f[meas]))]).astype(np.float32)
-    else:
-        shift = np.zeros((n, 2), np.float32)
-
-    # Temporally contiguous lit clusters: correlation across a flashlight gap
-    # is meaningless (the beam moved, the lit scene patch is a different
-    # scene), and each cluster anchors its own short-range model.
-    clusters = [[idxs[0]]]
-    for k in idxs[1:]:
-        if k - clusters[-1][-1] > 4:
-            clusters.append([k])
+        if len(idxs) < 3:
+            continue
+        idxs_f = np.asarray(idxs, np.float64)
+        shs_f = np.asarray(shs, np.float64)
+        meas = np.isfinite(shs_f).all(axis=1)
+        kk = np.arange(n, dtype=np.float64)
+        if meas.sum() >= 3:
+            pred = np.stack([np.polyval(np.polyfit(idxs_f[meas],
+                                                   shs_f[meas][:, a], 1), kk)
+                             for a in (0, 1)], axis=1)
+            shift = (pred - pred[int(np.median(idxs_f[meas]))]).astype(np.float32)
         else:
-            clusters[-1].append(k)
-    bright = np.array([float((crops[k] * wm).sum() / max(wm.sum(), 1.0))
-                       for k in range(n)])
-    # sqrt(n): 3 lit frames are enough for a clean median; brightness is the
-    # dominant factor for a VISIBLE ground (flashlight-lit grass beats a
-    # longer window of dim frames, which stacks dark).
-    best = max(clusters, key=lambda c: np.sqrt(len(c)) * float(np.mean(bright[c])))
-
-    # Per-frame homography from the block displacement field, cluster only.
-    # The reference is the cluster's BRIGHTEST frame: the global ground gref
-    # sits in another cluster (beam on a different scene patch), so
-    # cross-cluster block correlation would measure nothing.
-    if len(best) >= 3:
-        gref_c = max(best, key=lambda k: bright[k])
-        blocks = reg.ground_blocks(wm)
-        ref_crop = crops[gref_c] - fixed
-        items = []
-        for k in best:
-            if k == gref_c:
-                items.append((k, np.eye(3)))
+            shift = np.zeros((n, 2), np.float32)
+        # Temporally contiguous lit clusters, tried best-scored first; each
+        # anchors its own short-range model.  A candidate reference pass can
+        # contain several windows (the beam-lit one + a correlation-joined
+        # one); every window gets its fit attempt, first to measure >=3
+        # homographies wins.
+        clusters = [[idxs[0]]]
+        for k in idxs[1:]:
+            if k - clusters[-1][-1] > 4:
+                clusters.append([k])
+            else:
+                clusters[-1].append(k)
+        clusters.sort(key=lambda c: -(np.sqrt(len(c))
+                                      * float(np.mean(bright[c]))))
+        for cl in clusters:
+            if len(cl) < 3:
                 continue
-            rows = reg.ground_block_shifts(crops[k] - fixed, ref_crop, blocks)
-            Mf, st = reg.homography_from_shifts(rows, crop_w, crop_h)
-            if Mf is not None:
-                items.append((k, Mf))
-        if len(items) >= 3:
-            coef, tinfo = reg.temporal_homography(items, crop_w, crop_h)
+            # Reference = the cluster's BRIGHTEST frame (cross-cluster
+            # reference sits on a different lit patch, measures nothing).
+            gref_c = max(cl, key=lambda k: bright[k])
+            blocks = reg.ground_blocks(wm)
+            ref_crop = crops[gref_c] - fixed
+            items = []
+            for k in cl:
+                if k == gref_c:
+                    items.append((k, np.eye(3)))
+                    continue
+                rows = reg.ground_block_shifts(crops[k] - fixed, ref_crop,
+                                               blocks)
+                Mf, st = reg.homography_from_shifts(rows, crop_w, crop_h)
+                if Mf is not None:
+                    items.append((k, Mf))
+            if arc is None:
+                arc = (idxs, idxs_f, shift, gref_r)
+            if len(items) < 3:
+                continue
+            best = cl
+            # Stack only frames whose homography was actually measured: gate-
+            # passed frames with no usable fit are flashlight-dark silhouettes;
+            # stacking them medians the lit detail to black, and a model
+            # extrapolated onto them puts the anchor in a phase nothing was
+            # measured at (01: 25-frame cluster, 10 fits in its lit head --
+            # stones from the 3 lit frames smeared to black).
+            orig_n = len(best)
+            orig_cluster = list(best)
+            runs, cur = [], [items[0][0]]
+            for kf in [k for k, _ in items[1:]]:
+                if kf - cur[-1] > 4:
+                    runs.append(cur); cur = [kf]
+                else:
+                    cur.append(kf)
+            runs.append(cur)
+            best = max(runs, key=lambda c: np.sqrt(len(c))
+                       * float(np.mean(bright[c])))
+            coef, tinfo = reg.temporal_homography(
+                [(k, M) for k, M in items if k in best], crop_w, crop_h)
             k_mid = int(np.median(best))
             A = np.linalg.inv(reg.eval_temporal_homography(coef, k_mid))
             S2 = np.diag([2.0, 2.0, 1.0])
@@ -254,17 +303,102 @@ def _plan_ground_motion(args, files, cleaned, ground_mask_img, ground_bbox,
                                         [reg.homography_metrics(Mf, crop_w, crop_h)[0]
                                          for _, Mf in items], 1)[0])
             corner_disp = []
+            # Hh is crop-local: applied to the FULL frame it pivots the
+            # rotation/scale at the scaled crop centre, offset from the ground
+            # strip by 2*(hx0, hy0) -- a 1.6deg roll becomes a 70px lever-arm
+            # smear that medians the grass rows into a ghost.  Conjugate the
+            # crop's full-res origin in before use.
+            T = np.array([[1.0, 0.0, 2.0 * hx0],
+                          [0.0, 1.0, 2.0 * hy0],
+                          [0.0, 0.0, 1.0]])
+            Ti = np.linalg.inv(T)
             for k in best:
                 Hh = A @ reg.eval_temporal_homography(coef, k)
-                ground_M[k] = (S2 @ Hh @ S2i).astype(np.float32)
+                ground_M[k] = (T @ S2 @ Hh @ S2i @ Ti).astype(np.float32)
                 corner_disp.append(reg.corner_displacement(Hh, crop_w, crop_h))
             p95 = float(np.percentile(corner_disp, 95))
             ground_static = p95 < 1.5
+            # Empirical ground-motion model choice.  The 8-block correlation
+            # measures the *illumination patch* movement; with a static camera
+            # (tripod creep, flashlight hand-off) that movement is parallax +
+            # light-spot drift, NOT a camera transform, and warping by it
+            # smears a sharp static foreground (01: raw stack grad^2 3.1e5,
+            # every warped variant 1.0e4).  Score each model by the gradient
+            # energy of the median stack of the measured half-res crops --
+            # alignment only survives if it actually sharpens.
+            def _model_score(Mrel):
+                st = []
+                for k in best:
+                    d = cv2.warpPerspective(
+                        crops[k] - fixed, Mrel[k].astype(np.float32),
+                        (crop_w, crop_h), flags=cv2.INTER_LINEAR,
+                        borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+                    st.append(d)
+                m = np.median(np.stack(st), axis=0)
+                gy = np.diff(m, axis=0)[:, :-1]
+                gx = np.diff(m, axis=1)[:-1, :]
+                # Score the INTERIOR of the real ground mask only: fade-band
+                # glow has no ground to align, and warped variants pull black
+                # border in up to p95 px deep -- scoring that edge lets a
+                # smeared raw stack outscore an aligned one on border
+                # artefacts (02 regression: raw beat homography 2.4:0.8).
+                sel = (gm_base[:-1, :-1] > 0) & (wm[:-1, :-1] > 0.5)
+                k_sel = 2 * int(np.ceil(p95)) + 13
+                sel = cv2.erode(sel.astype(np.uint8),
+                                np.ones((k_sel, k_sel), np.uint8)) > 0
+                if sel.sum() < 2000:
+                    sel = (gm_base[:-1, :-1] > 0) & (wm[:-1, :-1] > 0.5)
+                # MEDIAN |grad|, not mean grad^2: an unwarped median keeps
+                # every sensor hot pixel (spikes inflate mean grad^2), while
+                # warped variants displace hot pixels so the median rejects
+                # them -- 02: raw "outscored" homography 2.4:0.8 on that bias
+                # alone while the stacked stones are visibly sharper aligned.
+                g = np.abs(np.concatenate([gy[sel].ravel(), gx[sel].ravel()]))
+                return float(np.median(g))
+            gm_base = cv2.resize((ground_mask_img > 127).astype(np.uint8),
+                                 (gw, gh), interpolation=cv2.INTER_NEAREST)[
+                hy0:hy1, hx0:hx1]
+            I3 = np.eye(3)
+            Mrel = {m: {} for m in ("raw", "translation", "homography")}
+            tM = {}
+            for k in best:
+                Mrel["homography"][k] = A @ reg.eval_temporal_homography(coef, k)
+                Mrel["raw"][k] = I3
+                dx, dy = shift[k] if np.isfinite(shift[k]).all() else (0.0, 0.0)
+                tM[k] = np.array([[1.0, 0.0, dx], [0.0, 1.0, dy], [0.0, 0.0, 1.0]])
+            tinv = np.linalg.inv(tM[k_mid])
+            for k in best:
+                Mrel["translation"][k] = tM[k] @ tinv
+            scores = {m: _model_score(Mrel[m]) for m in Mrel}
+            model = max(scores, key=scores.get)
+            # Every structural sharpness metric on the median stack is biased
+            # toward "raw": an unaligned median preserves the sensor's fixed
+            # pattern and photon-noise texture, while alignment warps move
+            # them and the temporal median rejects them -- so inflated raw
+            # scores win on 02 (real tracked motion, accepted look is the
+            # homography stack) too.  auto is only trusted for near-static
+            # flashlight scenes; tracked sequences pass --ground-model.
+            forced = getattr(args, "ground_model", "auto")
+            if forced != "auto":
+                model = forced
+            ground_model = model
+            if model == "raw":
+                ground_static = True
+                for k in best:
+                    ground_M[k] = None
+            elif model == "translation":
+                ground_static = False
+                for k in best:
+                    ground_M[k] = None
+            diag_scores = {m: round(s, 4) for m, s in scores.items()}
             tmax = max(best, key=lambda k: abs(k - k_mid))
-            diag = dict(mode="homography",
+            diag = dict(mode=ground_model,
+                        model_sharpness=diag_scores,
                         gref=int(files[gref_c][0]),
                         anchor=int(files[k_mid][0]),
                         cluster=[int(files[k][0]) for k in best],
+                        cluster_all=([int(files[k][0]) for k in orig_cluster]
+                                     if orig_n != len(best) else None),
                         fits=len(items), kept=tinfo["kept"],
                         rot_rate_deg_per_frame=round(rot_rate, 4),
                         corner_disp_p95_px=round(p95, 2),
@@ -278,25 +412,37 @@ def _plan_ground_motion(args, files, cleaned, ground_mask_img, ground_bbox,
             _write_ground_compare(args, files, crops, fixed, coef, A, shift,
                                   k_mid, best, tmax)
             log(f"  ground motion: lit cluster IMG_{files[min(best)][0]}.."
-                f"IMG_{files[max(best)][0]} ({len(best)} frames, ref IMG_"
-                f"{files[gref_c][0]}): homography from 8-block correlation, "
-                f"rot rate {rot_rate:+.3f}deg/frame, anchor IMG_{files[k_mid][0]}: "
-                f"corner lever-arm displacement p95 {p95:.1f}px at half-res "
-                f"({'static' if ground_static else 'homography-aligned'})")
+                f"IMG_{files[max(best)][0]} ({len(best)} frames"
+                + (f", pruned from {orig_n}-frame cluster to measured fits"
+                   if orig_n != len(best) else "")
+                + f", ref IMG_"
+                f"{files[gref_c][0]}): 8-block correlation, anchor IMG_{files[k_mid][0]}: "
+                f"corner lever-arm displacement p95 {p95:.1f}px at half-res; "
+                f"ground model={ground_model}"
+                + (f" (forced by --ground-model)" if forced != "auto" else
+                   f" (stack sharpness " + " ".join(f"{m}={s:.1e}"
+                    for m, s in sorted(diag_scores.items())) + ")")
+                + f" -> {'static' if ground_static else ground_model + '-aligned'}")
             ground_keep = np.zeros(n, bool)
             ground_keep[list(best)] = True
             log(f"  ground layer frames: lit cluster only ({len(best)} frames; "
                 "replaces the top-brightness selection so every stacked frame "
                 "is measured against the same lit scene patch)")
-            return None, ground_M, ground_static, ground_keep
+            return (shift if ground_model == "translation" else None), \
+                ground_M, ground_static, ground_keep
 
+    if arc is None:
+        log("  ground motion: no textured (lit) ground frames to correlate; "
+            "foreground is a silhouette -> stacking unaligned")
+        return ground_shift, ground_M, ground_static, ground_keep
+    idxs, idxs_f, shift, gref_r = arc
     norms = np.linalg.norm(shift, axis=1)
     p95_shift = float(np.percentile(norms, 95))
     ground_static = p95_shift < 1.5
     ground_shift = shift
     k_mid = int(np.median(idxs_f))
     log(f"  ground motion: {len(idxs)} lit frames correlated vs IMG_"
-        f"{files[gref][0]}, arc fit -> shift vs arc centre IMG_{files[k_mid][0]}: "
+        f"{files[gref_r][0]}, arc fit -> shift vs arc centre IMG_{files[k_mid][0]}: "
         f"max {float(np.max(norms)):.2f} px, p95 {p95_shift:.2f} px at half-res "
         f"({'static' if ground_static else 'translation-aligned'})")
     return ground_shift, ground_M, ground_static, ground_keep
@@ -344,10 +490,10 @@ def _write_ground_compare(args, files, crops, fixed, coef, A, shift, k_mid,
 
 def _build_ground_layer(args, ground_mask_img, master, ground_store, ground_bbox,
                         ground_kept, ground_acc, ground_n, ground_static,
-                        stack_workers, stack_band_mb):
-    """Linear full-res ground layer: median of the kept (brightest, translation-
-    aligned) frames pasted into a master-based canvas inside the ground bbox,
-    with warp-edge pixels filled from the master; mean fallback."""
+                        stack_workers, stack_band_mb, ground_mode="translation"):
+    """Linear full-res ground layer: median of the kept (lit-cluster, aligned)
+    frames pasted into a master-based canvas inside the ground bbox, with
+    warp-edge pixels filled from the master; mean fallback."""
     if args.ground_dir:
         ground = _stack_ground_from_dir(args)
         if ground is None:
@@ -362,7 +508,7 @@ def _build_ground_layer(args, ground_mask_img, master, ground_store, ground_bbox
             return ground
         log(f"  ground layer: median of {ground_kept} frames "
             f"({gx1-gx0}x{gy1-gy0} px, "
-            f"{'static foreground' if ground_static else 'translation-aligned'})")
+            f"{'static foreground' if ground_static else ground_mode + '-aligned'})")
         gcrop = stacking.median_stack(
             ground_store[:ground_kept], gy1 - gy0, gx1 - gx0,
             workers=stack_workers, band_mb=stack_band_mb)
@@ -384,7 +530,7 @@ def _build_ground_layer(args, ground_mask_img, master, ground_store, ground_bbox
         return ground
     if ground_n:
         log(f"  ground layer: mean of {ground_n} frames "
-            f"({'static foreground' if ground_static else 'translation-aligned'})")
+            f"({'static foreground' if ground_static else ground_mode + '-aligned'})")
         return stacking.mean_ground(ground_acc, ground_n)
     log("  !! composite: no ground frames stacked; using the sky stack")
     return master.copy()
@@ -395,6 +541,13 @@ def run(args):
     frames_dir = os.path.join(args.out, "aligned")
     if args.save_frames:
         os.makedirs(frames_dir, exist_ok=True)
+
+    # A model mask boundary is an exact silhouette line, so a wide feather band
+    # only smears sky glow into the dark foreground (visible foggy strip);
+    # the ragged variance fallback is the case that needs a soft blend.
+    if args.composite_feather is None:
+        args.composite_feather = 3.0 if (args.composite and args.ground_mask) \
+            else 8.0
 
     if args.method == "mean":
         log("WARNING: --method mean is discouraged for astro sequences. A hot "
@@ -866,12 +1019,14 @@ def run(args):
     # already aligned.  This replaces the linear master that later steps use.
     composite_late = (args.composite and
                       getattr(args, "composite_stage", "early") == "late")
+    ground_mode = ("homography" if any(m is not None for m in ground_M)
+                   else "translation")
     t = time.perf_counter()
     if args.composite and not composite_late:
         ground = _build_ground_layer(args, ground_mask_img, master, ground_store,
                                      ground_bbox, ground_kept, ground_acc,
                                      ground_n, ground_static, stack_workers,
-                                     stack_band_mb)
+                                     stack_band_mb, ground_mode)
         sigma = max(8.0, 0.01 * gw)
         evidence = horizon.sky_evidence(
             horizon.variance(var_sum, var_sq, var_n), sigma)
@@ -979,8 +1134,23 @@ def run(args):
         ground = _build_ground_layer(args, ground_mask_img, master, ground_store,
                                      ground_bbox, ground_kept, ground_acc,
                                      ground_n, ground_static, stack_workers,
-                                     stack_band_mb)
-        ygr = stretch.apply_stretch(ground, sparams)
+                                     stack_band_mb, ground_mode)
+        if getattr(args, "ground_curve", "sky") == "own":
+            gnd = None if sky_mask is None else 1.0 - sky_mask
+            rows = np.flatnonzero(gnd.max(axis=1) > 0.9) if gnd is not None \
+                else np.array([], np.int64)
+            if len(rows) < 64:
+                rows = np.arange(int(H * 0.75), H)
+            _, _, _, gcurve = stretch.auto_stretch(
+                ground[rows[0]:rows[-1] + 1],
+                target_bg=args.ground_target_bg, return_params=True)
+            log(f"  ground curve: own MTF (stats over rows {rows[0]}..{rows[-1]}, "
+                f"target_bg {args.ground_target_bg:g})")
+        else:
+            gcurve = sparams
+            log("  ground curve: sky MTF")
+        ygr = np.clip(stretch.apply_stretch(ground, gcurve)
+                      * getattr(args, "ground_gain", 1.0), 0.0, 1.0)
         if sky_mask is None:
             sky_mask = np.ones((H, W), np.float32)
             sky_mask[int(H * 0.65):] = 0.0

@@ -63,7 +63,7 @@ def build_parser():
     ap.add_argument("--io-workers", type=int, default=0, metavar="N",
                     help="parallel CR2 decode workers for previews and the "
                          "full-res stacking pass (default 0 = auto from CPU "
-                         "count and RAM, capped at 16; ~2*N decoded frames "
+                         "count and RAM, capped at 8; ~2*N decoded frames "
                          "are held in RAM)")
     ap.add_argument("--stack-workers", type=int, default=0, metavar="N",
                     help="parallel row-band workers for the median stack "
@@ -186,9 +186,11 @@ def build_parser():
     c.add_argument("--composite-horizon", choices=["mask", "line"], default="mask",
                    help="'mask' follows a ragged tree/terrain line (default); "
                         "'line' forces a robust straight horizon fit")
-    c.add_argument("--composite-feather", type=float, default=8.0, metavar="PX",
-                   help="width (full-res px) of the blend band across the boundary "
-                        "(default 8)")
+    c.add_argument("--composite-feather", type=float, default=None, metavar="PX",
+                   help="sigma (full-res px) of the blend band across the boundary "
+                        "(default: 3 with --ground-mask -- a wide band over a dark "
+                        "silhouette renders as a foggy gradient; 8 with the "
+                        "variance fallback)")
     c.add_argument("--composite-thresh", type=float, default=0.05, metavar="T",
                    help="sky-evidence threshold (fraction of the 99.5th percentile); "
                         "raise it to pull the boundary up, lower it to include "
@@ -211,6 +213,29 @@ def build_parser():
                    help="first frame of the ground sequence (default: --start)")
     c.add_argument("--ground-end", type=int, default=None,
                    help="last frame of the ground sequence (default: --end)")
+    c.add_argument("--ground-model",
+                   choices=["auto", "raw", "translation", "homography"],
+                   default="auto",
+                   help="ground-motion model for stacking the lit ground layer: "
+                        "auto (default) picks raw/translation/homography by "
+                        "measured stack sharpness -- reliable for near-static "
+                        "flashlight scenes (the lit-patch/parallax 'motion' is "
+                        "not a camera transform, warping smears the static "
+                        "foreground); for sequences with REAL tracked ground "
+                        "motion pass homography (auto's sharpness metric is "
+                        "biased toward raw by the median stack's fixed-pattern "
+                        "preservation). 'raw' stacks the ground unaligned")
+    c.add_argument("--ground-curve", choices=["sky", "own"], default="sky",
+                   help="grading curve for the ground layer (late composite): "
+                        "'sky' (default) reuses the sky's MTF curve (matched tone "
+                        "scale); 'own' measures the MTF on the ground pixels alone "
+                        "(presses black down -> dark foreground with less noise)")
+    c.add_argument("--ground-target-bg", type=float, default=0.10, metavar="BG",
+                   help="with --ground-curve own: MTF target background of the "
+                        "ground strip (default 0.10; higher = brighter ground)")
+    c.add_argument("--ground-gain", type=float, default=1.0, metavar="F",
+                   help="display-domain multiplier on the graded ground "
+                        "(default 1.0; flashlight-dark ground: 1.5-2.0)")
     return ap
 
 

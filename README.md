@@ -170,7 +170,7 @@ align_stack.py
   --method {mean,median}   combiner (default: median; mean is discouraged)
   --exclude 6007,6012      drop specific frames
   --workers N              parallel registration threads (default 0 = auto)
-  --io-workers N           parallel CR2 decoders (default 0 = auto, cap 16)
+  --io-workers N           parallel CR2 decoders (default 0 = auto, cap 8)
   --stack-workers N        parallel median row bands (default 0 = auto)
   --stack-band-mb MB       target median band working set (default 0 = 16 MB)
   --render-workers N       parallel stage TIFF/JPEG writers (default 0 = auto, cap 8)

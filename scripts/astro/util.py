@@ -62,7 +62,10 @@ def auto_workers(kind, n_items):
         return max(1, min(n_items, cpus))
 
     if kind == "io":
-        workers = min(n_items, 16, max(2, cpus // 2))
+        # Cap 8, not 16: at 8 workers decoding already outruns the stacking
+        # loop ~4x, while 16 doubles the in-flight queue (~8 GB) and gets the
+        # run killed by the OS under memory pressure with no measured gain.
+        workers = min(n_items, 8, max(2, cpus // 2))
         if mem is not None:
             workers = min(workers, max(1, int(mem * 0.25 / 0.24)))
         return max(1, workers)
