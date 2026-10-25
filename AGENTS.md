@@ -30,8 +30,12 @@ Guidance for AI coding agents working in this repository.
 
 ## Layout
 
-- `scripts/align_stack.py` — the CLI/argparse entry point (kept thin); it just
-  parses arguments and calls `astro.pipeline.run`.
+- `scripts/align_stack.py` — pipeline 1 (sky) CLI entry point (kept thin); it
+  just parses arguments and calls `astro.pipeline.run`. It NEVER composites
+  sky and ground together.
+- `scripts/composite_ground.py` — pipeline 2 (ground composite) CLI entry
+  point; it calls `astro.composite.run_ground_composite` and requires
+  `--sky`/`--ground`/`--mask` (no mask, no composite).
 - `scripts/astro/` — the implementation, one module per pipeline step:
   - `util.py` logging + array helpers; `imgio.py` CR2 decode / TIFF write
   - `registration.py` ORB + star-centroid similarity registration
@@ -39,8 +43,10 @@ Guidance for AI coding agents working in this repository.
   - `flat.py` auto flat (ABE); `stretch.py` auto MTF; `neutralize.py` background
     neutralization; `whitebalance.py` automatic star/sky white balance;
     `star_reduce.py` star shrink
-  - `composite.py` sky/ground ("天地") stitch; `horizon.py` sky-ground boundary
-    detection
+  - `composite.py` the sky/ground ("天地") composite = **pipeline 2** (loads
+    pipeline 1's sky/ground TIFFs + the agent-drawn mask, grades and stitches);
+    the boundary is mask-only — variance auto-detection was removed, one-shot
+    compositing is forbidden (see SKILL.md)
   - `render.py` per-stage TIFF/JPEG, montage, comparison figures
   - `pipeline.py` the orchestration that sequences the steps
 - `requirements.txt` — pinned-free dependency list (`numpy`, `opencv-python`, `rawpy`).

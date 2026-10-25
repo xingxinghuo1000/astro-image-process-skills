@@ -25,13 +25,13 @@
 | **星空配准** | ORB 特征匹配 + 星点质心精修，拟合**单应变换**（旋转天空的正确模型 `K R K^-1`），并用匹配分、内点数、星点残差做合理性校验，剔除坏帧。支持 `--workers` 多线程逐帧并行。 |
 | **叠加** | 分块**中值**（推荐）或加权**均值**；中值用磁盘 memmap，长序列也不会爆内存，并按行带并行计算（`--stack-workers`）。 |
 | **热噪点去除** | 单帧、逐通道检测彩色热噪点（被单一通道支配的孤立局部极大），做"美化式"修复并输出前后对比图。`--hot-pre`（逐原始帧）或 `--hot-post`（叠加后）。 |
-| **天地合成** | 在天地分界线处，把「对齐到星空的天景」和「静态地景层」拼接。地景层默认取**最亮的 5% 帧**（手电/光绘通常只出现在少数帧），避免对全序列取中值后地景变黑、细节丢失；可用 `--ground-top` 调整帧数、`--ground-top -1` 用全部帧。分界线可由**大模型识图**给出（推荐），或用时间方差自动检测。 |
+| **天地合成** | 在天地分界线处，把「对齐到星空的天景」和「静态地景层」拼接。地景层默认取**最亮的 5% 帧**（手电/光绘通常只出现在少数帧），避免对全序列取中值后地景变黑、细节丢失；可用 `--ground-top` 调整帧数、`--ground-top -1` 用全部帧。分界线掩膜**必须**由大模型观看导出的地景预览后识别产出；合成是独立的第二条命令（`composite_ground.py`），没有掩膜直接拒跑——**严格禁止一条命令一把走完天地合成**，方差自动检测已整体删除。 |
 | **自动平场（ABE）** | 在**线性图**上做类 PixInsight `AutomaticBackgroundExtractor` 的二维多项式背景拟合，可减可除，带强度混合与多强度对比。 |
 | **自动拉伸** | 自适应 MTF 拉伸，把天空背景放到目标亮度。 |
 | **背景中性化** | 逐通道缩放，把天空背景校正为中性灰（消除光害导致的偏色）。 |
 | **自动白平衡** | 中性化之后按星点/天空测量通道增益（whitepatch / grayworld / mixed），保持亮度；输出 `wb_compare.jpg` 供目视判断，可手动 `--wb-gains`。 |
 | **缩星** | 高通星点掩膜 + 形态学收缩，让星云/银河更突出。 |
-| **产物** | 每个阶段 16-bit TIFF + 预览、阶段拼接对比图，以及全分辨率最终成品 `merge_final_<start>_<end>.tif/.jpg`。 |
+| **产物** | 每个阶段 16-bit TIFF + 预览、阶段拼接对比图、全分辨率天空成品 `sky_final_<start>_<end>.tif/.jpg`（pipeline 1），以及天地合成成品 `merge_final_<start>_<end>.tif/.jpg`（pipeline 2）。 |
 
 ---
 
@@ -91,7 +91,7 @@ git clone git@github.com:xingxinghuo1000/astro-image-process-skills.git \
 （星野、星空、银河、对齐、叠加、*star field alignment*、*astro stacking*、
 *CR2 alignment*），你的请求命中时 agent 会自动加载本 skill：它会读 `SKILL.md`、
 准备好 `.venv`、用正确的参数跑 `scripts/align_stack.py` 并查看结果——因为它能看图，
-还会为天地合成产出 `--ground-mask`。可以这样提需求：
+天地合成会导出地景层与预览，由 agent **观看预览后识别地景、产出掩膜**（硬闸门，见 SKILL.md）。可以这样提需求：
 
 **1. 只做对齐 + 叠加（日常）**
 
@@ -107,15 +107,21 @@ git clone git@github.com:xingxinghuo1000/astro-image-process-skills.git \
 
 > **你：** "`D:\pic\DCIM-2026\08-shangduhu-2` 的 5994–6012 走完整流程：平场 + 中性化 + 缩星，最后做天地合成，前景要清晰。"
 
-agent 会先带 `--composite` 跑完整条链，看它刚生成的 `ground_stack_preview.jpg`，
-用视觉把前景（树、圆顶、地形）标成一张**白色=地景**的 `ground_mask.png`，再带
-`--ground-mask` 重跑，让分界线紧贴树冠。它内部实际执行的命令：
+天空与地景是**两条独立流水线（严格禁止一把走完）**：agent 先带 `--composite` 跑天空流水线（只导出地景层、绝不相合），然后**亲自观看导出的 `ground_stack_preview.jpg`**，用视觉把前景（树、圆顶、地形）标成一张**白色=地景**的 `ground_mask.png`，再跑地景合成流水线把两层贴合，让分界线紧贴树冠。它内部实际执行的命令：
 
 ```bash
+# pipeline 1：天空全链 + 地景层导出（永不相合天地）
 ./.venv/Scripts/python.exe scripts/align_stack.py \
     --dir "D:\pic\DCIM-2026\08-shangduhu-2" --method median \
     --flat --flat-strength 0.5 --neutralize --wb --star-reduce 1 \
-    --composite --ground-mask out/ground_mask.png --out out
+    --composite --out out
+
+# agent 观看 out/ground_stack_preview.jpg，画出 out/ground_mask.png
+
+# pipeline 2：地景合成（没有 --mask 直接拒跑）
+./.venv/Scripts/python.exe scripts/composite_ground.py \
+    --sky out/sky_final_5994_6012.tif --ground out/ground_stack.tif \
+    --mask out/ground_mask.png --out out
 ```
 
 最后报告成品 `out/merge_final_5994_6012.tif/.jpg`，并给你看
@@ -134,7 +140,7 @@ agent 会先带 `--composite` 跑完整条链，看它刚生成的 `ground_stack
 **6. 继续对话微调**
 
 > "树太糊了 / 天空又出现星轨了 / 背景还偏紫 / 星星再收一点" —— agent 会改
-> `--composite-feather`、`--composite-thresh`、`--flat-strength`、`--neutralize`、`--wb-strength`
+> `--ground-top`、`--feather`、`--ground-gain`、`--flat-strength`、`--neutralize`、`--wb-strength`
 > 或 `--star-reduce` 重跑，并重新核对叠加图和阶段拼接图。
 
 想自己手动跑，见下面的「手动 CLI 用法」。
@@ -190,14 +196,22 @@ align_stack.py
   --hot-pre / --hot-post   逐原始帧 / 在叠加主图上检测并修复
   --hot-sigma 6 --hot-abs 0.02 --hot-ksize 5 --hot-color 2 --hot-neigh 1 --hot-grow 3
 
-天地合成
-  --composite              开启
-  --ground-mask PATH       大模型识别的地景掩膜（白 = 地景）
+地景层导出（pipeline 1 只导出，永不相合）
+  --composite              导出 ground_stack.tif + 预览 + sky_curve.json
+  --ground-band 0.35       地景裁剪带（占画面高度比例）
   --ground-method {mean,median}   地景合成方式（默认 median）
   --ground-top N           只用最亮的 N 帧地景（默认 5%，至少 3 帧；-1 = 全部帧）
-  --composite-horizon {mask,line}
-  --composite-thresh 0.05 --composite-feather 8
+  --ground-model {auto,raw,translation,homography}
   --ground-dir DIR --ground-start N --ground-end N   用另一组地景序列
+
+地景合成（pipeline 2：scripts/composite_ground.py）
+  --sky PATH               pipeline 1 的 sky_final_<s>_<e>.tif（必填）
+  --ground PATH            pipeline 1 的 ground_stack.tif（必填）
+  --mask PATH              大模型看预览后画的地景掩膜，白=地景（必填，无掩膜拒跑）
+  --curve PATH             天空 MTF 曲线（默认取 --sky 同目录 sky_curve.json）
+  --ground-curve {sky,own} --ground-target-bg 0.10 --ground-gain 1.0
+  --feather 3              羽化 σ（px）
+  --out DIR
 ```
 
 ### 约定与默认值
@@ -241,13 +255,12 @@ align_stack.py
 （树、建筑、地形、地平线）标成一张灰度掩膜，**白色 = 地景，黑色 = 天空**，
 例如 `out/ground_mask.png`。（用 skill 时，agent 会自动完成这一步。）
 
-第 3 步 —— 带着识别出的掩膜跑完整流程：
+第 3 步 —— pipeline 2 把两层贴合（无掩膜直接拒跑；一把走完的代码路径不存在）：
 
 ```bash
-./.venv/Scripts/python.exe scripts/align_stack.py \
-    --dir "D:\pic\DCIM-2026\08-shangduhu-2" --method median \
-    --flat --flat-strength 0.5 --neutralize --wb --star-reduce 1 \
-    --composite --ground-mask out/ground_mask.png --out out
+./.venv/Scripts/python.exe scripts/composite_ground.py \
+    --sky out/sky_final_5994_6012.tif --ground out/ground_stack.tif \
+    --mask out/ground_mask.png --out out
 ```
 
 看 `out/sky_ground_overlay.jpg` 检查：分界线（青色）应紧贴前景轮廓，天空里不应出现星轨。
@@ -307,10 +320,11 @@ align_stack.py
    开启 `--hot-pre` 时，在这里对每张全分辨率帧先修热噪点。
 3. **叠加** — 对齐后的帧用**分块中值**（memmap，行带并行）或加权均值合成 → `stage1_stacked`。
 4. **热噪点修复**（`--hot-post`）— 在叠加主图上逐通道检测并美化修复 → `stage2_hotfix`。
-5. **天地合成**（`--composite`）— 构建地景层（默认取最亮的 5% 帧做中值叠加；
-   `--ground-method mean` 改为均值以保留更多光绘，`--ground-top` 指定帧数），取得天地分界线
-   （大模型 `--ground-mask` 或时间方差自动检测），用羽化掩膜融合两层 →
-   `stageN_composite`。它成为后续所有步骤所操作的线性主图。
+5. **地景层导出**（`--composite`）— 构建地景层（跟踪架：亮帧簇内逐帧**单应**对齐；
+   固定三脚架：最亮的 5% 帧中值叠加，`--ground-top` 指定帧数，`--ground-method mean`
+   保留更多光绘），导出 `ground_stack.tif` + 预览 + `sky_curve.json`。pipeline 1
+   **永不相合天地**：必须由大模型观看预览画出分界线掩膜，再由 pipeline 2
+   （`composite_ground.py`）把地景按天空曲线调亮、在羽化带贴合。
 6. **自动平场 / ABE**（`--flat`）— 在**线性图**上拟合平滑的逐通道二维背景并减去/除去，
    按 `--flat-strength` 混合 → `stageN_flat`。同时写 `flat_compare.jpg` 供目视决策。
 7. **自动拉伸**（始终）— 自适应 MTF，把背景拉到目标亮度 → `stageN_stretched`。
@@ -329,8 +343,9 @@ align_stack.py
 | --- | --- |
 | `stageN_<name>.tif` + `_preview.jpg` | 每个处理阶段（16-bit TIFF + 半尺寸预览），`N` 为阶段序号。 |
 | `stages_montage.jpg` | 所有阶段并排、带标签的对比图。 |
-| `merge_final_<start>_<end>.tif` | **最终成品**，16-bit TIFF，全分辨率。`<start>`/`<end>` 为合并序列的首/末帧号。 |
-| `merge_final_<start>_<end>.jpg` | **最终成品**，JPEG，全分辨率。 |
+| `sky_final_<start>_<end>.tif` + `.jpg` | **pipeline 1 天空成品**，全分辨率；pipeline 2 的 `--sky` 输入（不做合成时即为交付成品）。 |
+| `merge_final_<start>_<end>.tif` + `.jpg` | **天地合成最终成品**，全分辨率——由 **pipeline 2**（`composite_ground.py`）产出，pipeline 1 永不输出。 |
+| `sky_curve.json` | 天空 MTF 拉伸曲线（pipeline 1 输出），pipeline 2 据此把地景调到同一色调刻度。 |
 | `stack_<method>.tif` | 叠加/合成后的线性主图（供外部后期）。 |
 | `stack_preview.jpg` | 线性主图预览。 |
 | `transforms.json` | 每帧的单应变换、内点数、评分。 |
@@ -338,8 +353,8 @@ align_stack.py
 | `hot_metrics.json`、`hot_compare_pre.jpg`、`hot_compare_post.jpg` | 热噪点审计与前后对比图。 |
 | `flat_compare.jpg` | 不平场 vs 平场（用 `--flat-sweep` 时还会平铺多个强度）。 |
 | `wb_compare.jpg` | 白平衡前/后对比图，标注实际增益（`--wb` 时）。 |
-| `ground_stack.tif` + `_preview.jpg` | 静态地景层（`--composite` 时）：默认取最亮 5% 帧，`--ground-top` 可调。 |
-| `sky_mask.png`、`sky_ground_overlay.jpg` | 天地合成掩膜与检查用叠加图（`--composite` 时）。 |
+| `ground_stack.tif` + `_preview.jpg` | 线性地景层 + 按天空曲线调亮的预览（`--composite` 时）；预览是**掩膜识别的法定依据**。 |
+| `sky_mask.png`、`sky_ground_overlay.jpg` | 合成边界掩膜（白=天，与给定掩膜互反）与检查用叠加图（**pipeline 2 输出**）。 |
 | `star_mask.png` | 星点掩膜（缩星时）。 |
 | `aligned/IMG_<n>.tif` | 每帧对齐结果（`--save-frames` 时）。 |
 
@@ -351,8 +366,9 @@ align_stack.py
 - **平场亮环。** 对银河铺满的画面做满强度 ABE，可能把中心压暗、边缘留一圈亮环——把
   `--flat-strength` 降到 ~0.3–0.6。
 - **天地合成需要静止前景。** 地景层默认取最亮的 5% 入选帧做中值叠加；跟踪（赤道仪）序列由星点位移判定后，对地景做逐帧**单应**对齐（亮帧簇内）——地景层锚定在簇中点，**换了所选簇要按新的 `ground_stack_preview.jpg` 重画地景掩膜**。
-- **地景掩膜极性。** `--ground-mask` 要求灰度图**白色 = 地景/前景**、黑色 = 天空；
-  边缘会按 `--composite-feather` 羽化。
+- **地景掩膜极性。** pipeline 2 的 `--mask` 要求灰度图**白色 = 地景/前景**、黑色 = 天空
+  （它写出的 `sky_mask.png` 是白=天，互反）；边缘按 `--feather` 羽化（默认 3，宽羽化会
+  把天空辉光渗进暗地景形成雾带）。
 - 默认的 `--dir/--start/--end` 指向示例序列，请替换为你自己的数据。
 
 ---

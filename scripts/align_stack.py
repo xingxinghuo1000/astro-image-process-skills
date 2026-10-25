@@ -16,22 +16,32 @@ orchestration and the module docstrings for the individual steps:
     neutralize    per-channel sky-background neutralization
     whitebalance  automatic star-colour / gray-world white balance
     star_reduce   star-mask morphology star shrink
-    composite     sky/ground ("天地") stitch at the detected horizon
     render        per-stage TIFF/JPEG, montage and comparison figures
+    composite     PIPELINE 2 (scripts/composite_ground.py): stitch sky_final
+                  + ground_stack at a model-drawn ground mask
 
 Stages (each enabled step adds one; the stretch is always applied):
-    stacked -> (hotfix) -> (composite) -> (flat) -> stretched -> (neutralized)
+    stacked -> (hotfix) -> (flat) -> stretched -> (neutralized)
         -> (whitebalanced) -> (star_reduced)
 
 Every stage is written as ``stage<i>_<name>.tif`` + ``_preview.jpg`` and tiled
-into ``stages_montage.jpg``; the finished image is written as a full-resolution
-TIFF and JPEG.  Outputs default to ``--out`` (``out/``).
+into ``stages_montage.jpg``; the finished sky image is ``sky_final_<s>_<e>.tif/.jpg``.
+With ``--composite`` the ground layer (``ground_stack.tif`` + preview +
+``sky_curve.json``) is exported for pipeline 2 -- this script never stitches
+sky and ground together (SKILL.md forbids one-shot compositing).
+Outputs default to ``--out`` (``out/``).
 
 Usage (Windows, using the repo's virtualenv):
+    # pipeline 1: sky (and the ground-layer export)
     .venv/Scripts/python.exe scripts/align_stack.py \
         --dir "D:\\pic\\DCIM-2026\\08-shangduhu-2" \
         --start 5994 --end 6012 --out out --ref 6003 --method median \
         --composite --flat --flat-strength 0.5 --neutralize --wb
+    # then: view out/ground_stack_preview.jpg, draw the ground mask (white =
+    # ground), and pipeline 2:
+    .venv/Scripts/python.exe scripts/composite_ground.py \
+        --sky out/sky_final_5994_6012.tif --ground out/ground_stack.tif \
+        --mask out/ground_mask.png --out out
 """
 import argparse
 
@@ -166,39 +176,22 @@ def build_parser():
                         "demosaic blob (a hot photosite spreads over ~3-5 px; "
                         "default 3)")
 
-    c = ap.add_argument_group("sky/ground composite (天地合成)")
+    c = ap.add_argument_group("ground layer for the composite pipeline (地景层产出)")
     c.add_argument("--composite", action="store_true",
-                   help="stitch the star-aligned sky onto a temporally stacked "
-                        "ground layer, split at the detected sky-ground boundary "
-                        "('天地分界线')")
-    c.add_argument("--composite-stage", choices=["early", "late"],
-                   default="late",
-                   help="'late' (default): the sky runs the whole chain first "
-                        "(flat / stretch / neutralize / white balance / star "
-                        "reduction measured on pure sky), the ground is "
-                        "stretched with the sky's curve and stitched last -- "
-                        "sky stats uncontaminated by the foreground, and the "
-                        "ground layer (ground_stack.tif) stays a separate, "
-                        "re-adjustable product you can re-grade and re-stitch "
-                        "without rerunning the chain; needs --ground-mask. "
-                        "'early': stitch in the linear domain (legacy), all "
-                        "post-processing acts on the composite")
-    c.add_argument("--composite-horizon", choices=["mask", "line"], default="mask",
-                   help="'mask' follows a ragged tree/terrain line (default); "
-                        "'line' forces a robust straight horizon fit")
-    c.add_argument("--composite-feather", type=float, default=None, metavar="PX",
-                   help="sigma (full-res px) of the blend band across the boundary "
-                        "(default: 3 with --ground-mask -- a wide band over a dark "
-                        "silhouette renders as a foggy gradient; 8 with the "
-                        "variance fallback)")
-    c.add_argument("--composite-thresh", type=float, default=0.05, metavar="T",
-                   help="sky-evidence threshold (fraction of the 99.5th percentile); "
-                        "raise it to pull the boundary up, lower it to include "
-                        "fainter sky (default 0.05)")
-    c.add_argument("--ground-mask", default="",
-                   help="path to a ground mask (grayscale PNG, white = ground) "
-                        "recognised by a large image model; overrides the "
-                        "variance-based boundary detection")
+                   help="build the temporal ground layer (per-frame "
+                        "homography-aligned, lit-cluster median) and export it "
+                        "as ground_stack.tif + ground_stack_preview.jpg + "
+                        "sky_curve.json.  This pipeline NEVER stitches: the "
+                        "boundary mask must be drawn by a vision model looking "
+                        "at the preview, and scripts/composite_ground.py does "
+                        "the stitch (one-shot sky+ground compositing is "
+                        "forbidden)")
+    c.add_argument("--ground-band", type=float, default=0.35, metavar="F",
+                   help="fraction of the frame height used as the ground crop "
+                        "band (default 0.35 = bottom 35%%).  It must cover the "
+                        "whole foreground the model will later mask: a ridge "
+                        "topping out above the band leaves the upper foreground "
+                        "unwarped in the export")
     c.add_argument("--ground-method", choices=["mean", "median"], default="median",
                    help="combine the ground layer: median (default) rejects "
                         "transient flashlight/people and hot pixels; mean keeps "
@@ -225,17 +218,6 @@ def build_parser():
                         "motion pass homography (auto's sharpness metric is "
                         "biased toward raw by the median stack's fixed-pattern "
                         "preservation). 'raw' stacks the ground unaligned")
-    c.add_argument("--ground-curve", choices=["sky", "own"], default="sky",
-                   help="grading curve for the ground layer (late composite): "
-                        "'sky' (default) reuses the sky's MTF curve (matched tone "
-                        "scale); 'own' measures the MTF on the ground pixels alone "
-                        "(presses black down -> dark foreground with less noise)")
-    c.add_argument("--ground-target-bg", type=float, default=0.10, metavar="BG",
-                   help="with --ground-curve own: MTF target background of the "
-                        "ground strip (default 0.10; higher = brighter ground)")
-    c.add_argument("--ground-gain", type=float, default=1.0, metavar="F",
-                   help="display-domain multiplier on the graded ground "
-                        "(default 1.0; flashlight-dark ground: 1.5-2.0)")
     return ap
 
 

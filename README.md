@@ -26,13 +26,13 @@ foreground sharp.
 | **Sky registration** | ORB feature matching + star-centroid refinement, fitting a projective **homography** per frame (the correct model for a rotating sky: `K R K^-1`), with plausibility checks (match score, inliers, star residual) that reject bad frames. Frames register in parallel with `--workers` (default: one per CPU core). |
 | **Stacking** | Block-wise **median** (recommended) or weighted **mean**; median uses an on-disk memmap so long sequences fit in RAM, and independent row bands are processed in parallel (`--stack-workers`). |
 | **Hot-pixel removal** | Per-channel, single-frame detection of colored hot pixels (isolated local maxima dominated by one channel), with cosmetic repair and before/after figures. `--hot-pre` (per raw frame) or `--hot-post` (stacked). |
-| **Sky/ground composite** | Stitches the star-aligned sky onto a sharp ground layer at the sky/ground boundary. Fixed tripod: the ground is static, the layer is a median of the **brightest 5% of frames** (light painting is usually transient). Sky-tracked (equatorial mount): the ground sweeps across the frames, and the apparent motion is a camera rotation — a **per-frame homography** (fit from 8 block phase-correlations, flashlight-lit frame cluster only) aligns it; a plain translation aligns only the centre and ghosts the wide-angle edges. The boundary can be recognised by a **large vision model** (recommended) or detected automatically from temporal variance. |
+| **Sky/ground composite** | Stitches the star-aligned sky onto a sharp ground layer at the sky/ground boundary. Fixed tripod: the ground is static, the layer is a median of the **brightest 5% of frames** (light painting is usually transient). Sky-tracked (equatorial mount): the ground sweeps across the frames, and the apparent motion is a camera rotation — a **per-frame homography** (fit from 8 block phase-correlations, flashlight-lit frame cluster only) aligns it; a plain translation aligns only the centre and ghosts the wide-angle edges. The boundary mask must be drawn by a **large vision model after viewing the exported ground preview** — compositing is a separate second command (`composite_ground.py`) that refuses to run without the mask; one-shot sky+ground compositing is forbidden and variance auto-detection was removed. |
 | **Auto flat (ABE)** | PixInsight `AutomaticBackgroundExtractor`-style 2D polynomial background fit on the **linear** image, subtract/divide, with a blend strength and a strength sweep. |
 | **Auto stretch** | Adaptive mid-tone-transfer (MTF) stretch that places the sky background at a target level. |
 | **Background neutralization** | Per-channel scaling so the sky background becomes neutral grey (removes light-pollution color casts). |
 | **Auto white balance** | Luminance-preserving star/sky white balance after neutralization (whitepatch, grayworld or mixed), with a `wb_compare.jpg` for visual review and manual `--wb-gains` override. |
 | **Star reduction** | High-pass star mask + morphological shrink to make nebulae/the Milky Way stand out. |
-| **Deliverables** | Every intermediate stage as 16-bit TIFF + preview, a stage montage, and a full-resolution final `merge_final_<start>_<end>.tif/.jpg`. |
+| **Deliverables** | Every intermediate stage as 16-bit TIFF + preview, a stage montage, the full-resolution sky `sky_final_<start>_<end>.tif/.jpg` (pipeline 1), and the composite `merge_final_<start>_<end>.tif/.jpg` (pipeline 2). |
 
 ---
 
@@ -112,16 +112,26 @@ This is a multi-turn exchange:
 
 > **You:** "`D:\pic\DCIM-2026\08-shangduhu-2` 的 5994–6012 走完整流程：平场 + 中性化 + 缩星，最后做天地合成，前景要清晰。"
 
-The agent runs the whole chain once with `--composite`, looks at the
-`ground_stack_preview.jpg` it just produced, uses its vision to mark the
-foreground (tree, dome, terrain) as a white-on-black `ground_mask.png`, then
-re-runs with `--ground-mask` so the boundary hugs the tree — under the hood:
+Sky and ground are **two separate pipelines — one-shot compositing is forbidden**.
+The agent runs the sky pipeline with `--composite` (which exports the ground
+layer but never stitches), then **looks at the exported
+`ground_stack_preview.jpg` with its vision**, marks the foreground (tree, dome,
+terrain) as a white-on-black `ground_mask.png`, and runs the ground-composite
+pipeline on the two layers — under the hood:
 
 ```bash
+# pipeline 1: sky chain + ground-layer export (never composites)
 ./.venv/Scripts/python.exe scripts/align_stack.py \
     --dir "D:\pic\DCIM-2026\08-shangduhu-2" --method median \
     --flat --flat-strength 0.5 --neutralize --wb --star-reduce 1 \
-    --composite --ground-mask out/ground_mask.png --out out
+    --composite --out out
+
+# the agent views out/ground_stack_preview.jpg and draws out/ground_mask.png
+
+# pipeline 2: ground composite (refuses to run without --mask)
+./.venv/Scripts/python.exe scripts/composite_ground.py \
+    --sky out/sky_final_5994_6012.tif --ground out/ground_stack.tif \
+    --mask out/ground_mask.png --out out
 ```
 
 It reports the final `out/merge_final_5994_6012.tif/.jpg` and shows you
@@ -140,7 +150,7 @@ It reports the final `out/merge_final_5994_6012.tif/.jpg` and shows you
 **6. Keep refining conversationally**
 
 > "树太糊了 / 天空又出现星轨了 / 背景还偏紫 / 星星再收一点" — the agent tweaks
-> `--composite-feather`, `--composite-thresh`, `--flat-strength`, `--neutralize`, `--wb-strength`
+> `--ground-top`, `--feather`, `--ground-gain`, `--flat-strength`, `--neutralize`, `--wb-strength`
 > or `--star-reduce` and re-runs, re-checking the overlay and montage each time.
 
 Prefer driving it by hand? See [Manual CLI usage](#manual-cli-usage).
@@ -197,15 +207,24 @@ Hot pixels
   --hot-pre / --hot-post   detect+repair per raw frame / on the stacked master
   --hot-sigma 6 --hot-abs 0.02 --hot-ksize 5 --hot-color 2 --hot-neigh 1 --hot-grow 3
 
-Sky/ground composite (天地合成)
-  --composite              enable
-  --ground-mask PATH       ground mask from a large vision model (white = ground)
+Ground layer for the composite (pipeline 1 exports, never stitches)
+  --composite              build+export ground_stack.tif, preview, sky_curve.json
+  --ground-band 0.35       ground crop band (fraction of frame height)
   --ground-method {mean,median}   ground combiner (default: median)
   --ground-top N           use the N brightest ground frames (default: 5%, min 3;
                            -1 = all frames)
-  --composite-horizon {mask,line}
-  --composite-thresh 0.05 --composite-feather 8
+  --ground-model {auto,raw,translation,homography}
   --ground-dir DIR --ground-start N --ground-end N   ground from another sequence
+
+Ground composite (pipeline 2: scripts/composite_ground.py)
+  --sky PATH               pipeline-1 sky_final_<s>_<e>.tif   (required)
+  --ground PATH            pipeline-1 ground_stack.tif        (required)
+  --mask PATH              model-drawn ground mask, white = ground (required:
+                           no mask, no composite)
+  --curve PATH             sky MTF curve (default: sky_curve.json next to --sky)
+  --ground-curve {sky,own} --ground-target-bg 0.10 --ground-gain 1.0
+  --feather 3              blend sigma px
+  --out DIR
 ```
 
 ### Defaults and conventions
@@ -254,13 +273,13 @@ mark the **ground / foreground** (tree, building, terrain, horizon) as a
 grayscale mask with **white = ground, black = sky**, e.g. `out/ground_mask.png`.
 (When you use the skill, the agent does this step for you.)
 
-Step 3 — full run with the recognised mask:
+Step 3 — pipeline 2 stitches the two layers (it refuses to run without the
+mask; one-shot compositing does not exist):
 
 ```bash
-./.venv/Scripts/python.exe scripts/align_stack.py \
-    --dir "D:\pic\DCIM-2026\08-shangduhu-2" --method median \
-    --flat --flat-strength 0.5 --neutralize --wb --star-reduce 1 \
-    --composite --ground-mask out/ground_mask.png --out out
+./.venv/Scripts/python.exe scripts/composite_ground.py \
+    --sky out/sky_final_5994_6012.tif --ground out/ground_stack.tif \
+    --mask out/ground_mask.png --out out
 ```
 
 Check `out/sky_ground_overlay.jpg`: the boundary is drawn in cyan and should hug
@@ -334,12 +353,14 @@ Optional steps are added to the stage list only when their flag is set, and the
    (memmap-backed) or a weighted mean → `stage1_stacked`.
 4. **Hot-pixel repair** (`--hot-post`) — per-channel detection on the stacked
    master and cosmetic repair → `stage2_hotfix`.
-5. **Sky/ground composite** (`--composite`) — build a ground layer from the
-   **brightest 5% of frames** (median by default; `--ground-method mean` keeps
-   more light painting; `--ground-top` overrides the count), get the sky/ground
-   boundary (large-model `--ground-mask` or temporal-variance detection), and
-   blend the two layers with a feathered mask → `stageN_composite`. This becomes
-   the linear master for later steps.
+5. **Ground-layer export** (`--composite`) — build a ground layer (tracked
+   rigs: per-frame homography over the flashlight-lit frame cluster; fixed
+   tripod: median of the **brightest 5% of frames**, `--ground-top` overrides,
+   `--ground-method mean` keeps more light painting) and export it as
+   `ground_stack.tif` + preview + `sky_curve.json`. Pipeline 1 **never
+   composites**: a large vision model must view the preview and draw the
+   boundary mask, then pipeline 2 (`composite_ground.py`) grades the ground
+   with the sky curve and blends the two layers there.
 6. **Auto flat / ABE** (`--flat`) — fit a smooth per-channel 2D background on the
    **linear** image and subtract/divide it, blended by `--flat-strength` →
    `stageN_flat`. Writes `flat_compare.jpg` for a visual decision.
@@ -364,8 +385,9 @@ Optional steps are added to the stage list only when their flag is set, and the
 | --- | --- |
 | `stageN_<name>.tif` + `_preview.jpg` | Each processing stage (16-bit TIFF + half-size preview); `N` is the stage number. |
 | `stages_montage.jpg` | All stages side by side, labelled. |
-| `merge_final_<start>_<end>.tif` | **Final image**, 16-bit TIFF at full resolution. `<start>`/`<end>` are the first/last merged frame numbers. |
-| `merge_final_<start>_<end>.jpg` | **Final image**, JPEG at full resolution. |
+| `sky_final_<start>_<end>.tif` + `.jpg` | **Pipeline-1 finished sky** at full resolution; the `--sky` input of pipeline 2 (the deliverable when not compositing). |
+| `merge_final_<start>_<end>.tif` + `.jpg` | **Sky/ground composite final image** — produced by **pipeline 2** (`composite_ground.py`), never by pipeline 1. |
+| `sky_curve.json` | Sky MTF stretch curve (black points, white point, m), written by pipeline 1 so pipeline 2 grades the ground on the same tone scale. |
 | `stack_<method>.tif` | Linear master after stacking/composite (for external post). |
 | `stack_preview.jpg` | Preview of the linear master. |
 | `transforms.json` | Per-frame homography, inliers, score. |
@@ -373,8 +395,8 @@ Optional steps are added to the stage list only when their flag is set, and the
 | `hot_metrics.json`, `hot_compare_pre.jpg`, `hot_compare_post.jpg` | Hot-pixel audit and before/after figures. |
 | `flat_compare.jpg` | No-flat vs flat (and a strength sweep when `--flat-sweep` is used). |
 | `wb_compare.jpg` | Before vs after white balance, labelled with the applied gains. |
-| `ground_stack.tif` + `_preview.jpg` | Static ground layer (with `--composite`): brightest 5% by default; `--ground-top` controls the count. |
-| `sky_mask.png`, `sky_ground_overlay.jpg` | Composite mask and inspection overlay (with `--composite`). |
+| `ground_stack.tif` + `_preview.jpg` | Linear ground layer + sky-curve-graded preview (with `--composite`); the preview is what the model must view to draw the mask. |
+| `sky_mask.png`, `sky_ground_overlay.jpg` | Composite boundary mask (white = sky, inverted from your mask) and inspection overlay — **pipeline 2** outputs. |
 | `star_mask.png` | Star mask (when star reduction runs). |
 | `aligned/IMG_<n>.tif` | Each aligned frame (with `--save-frames`). |
 

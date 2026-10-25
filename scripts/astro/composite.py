@@ -1,25 +1,31 @@
-"""Sky/ground composite -- stitch a star-aligned sky stack onto a static ground
-stack, splitting them at the detected sky-ground boundary ("天地分界线").
+"""Pipeline 2 -- the sky/ground ("天地") composite.
 
-Both layers come from the same frames:
+This pipeline stitches pipeline 1's two exported layers at a sky/ground
+boundary:
 
-* the **sky** stack is registered on the stars, so the sky is sharp and the
-  static foreground is smeared by the frame-to-frame rotation;
-* the **ground** stack is the plain (un-registered) average, so the foreground
-  is sharp and the sky is smeared into star trails.
+* ``sky_final_<s>_<e>.tif``   -- the graded sky (the whole chain measured on
+  pure sky), display domain;
+* ``ground_stack.tif``        -- the linear temporal ground layer (per-frame
+  homography-aligned, lit-cluster median);
+* a ground mask PNG           -- white = ground, drawn by a VISION MODEL after
+  viewing ``ground_stack_preview.jpg``.
 
-The boundary comes from ``horizon.detect`` (temporal motion variance); this
-module builds the feathered mask, blends the two layers with it, and writes the
-inspection figures (the ground layer, the mask and an overlay).
+One-shot sky+ground compositing in a single command is forbidden (SKILL.md):
+the mask must come from a model/human that LOOKED at the preview, which is
+only possible once pipeline 1 has exported it.  This module therefore never
+decodes CR2 frames and never detects the boundary from image statistics --
+no mask, no composite.
 """
+import json
 import os
+import re
+
 import cv2
 import numpy as np
 
-from .util import log, to_u8
+from .util import log
 from .imgio import write_tiff16
-from .stretch import auto_stretch
-from . import horizon
+from .stretch import auto_stretch, apply_stretch
 
 
 def compose(sky, ground, mask):
@@ -27,70 +33,104 @@ def compose(sky, ground, mask):
     return np.clip(sky * m + ground * (1.0 - m), 0, 1)
 
 
-def _overlay(comp, half_mask, line, target_bg, path, quality=88):
-    """Inspection figure: the composited result with the detected boundary."""
-    disp = to_u8(auto_stretch(comp, target_bg=target_bg)[0])
-    disp = cv2.resize(disp, (half_mask.shape[1], half_mask.shape[0]),
+def load_tiff16_rgb(path):
+    """Read a 16-bit TIFF written by write_tiff16 back to float RGB [0, 1]."""
+    a = cv2.imread(path, cv2.IMREAD_UNCHANGED)
+    if a is None:
+        raise SystemExit(f"cannot read {path}")
+    if a.ndim == 2:
+        a = cv2.cvtColor(a, cv2.COLOR_GRAY2RGB)
+    else:
+        a = cv2.cvtColor(a, cv2.COLOR_BGR2RGB)
+    return a.astype(np.float32) / (65535.0 if a.dtype == np.uint16 else 255.0)
+
+
+def run_ground_composite(args):
+    """Grade the ground layer, stitch it under the sky at the model mask,
+    and write merge_final_*.tif/.jpg + sky_mask.png + sky_ground_overlay.jpg."""
+    os.makedirs(args.out, exist_ok=True)
+    for p in (args.sky, args.ground):
+        if not os.path.isfile(p):
+            raise SystemExit(f"missing layer file: {p} (run pipeline 1 first: "
+                             "scripts/align_stack.py --composite)")
+    sky = load_tiff16_rgb(args.sky)
+    ground = load_tiff16_rgb(args.ground)
+    if sky.shape != ground.shape:
+        raise SystemExit(f"layer sizes differ: sky {sky.shape} vs "
+                         f"ground {ground.shape} (both must come from the "
+                         "same pipeline-1 run)")
+    H, W = sky.shape[:2]
+
+    # The model mask is white = ground; the stitch mask is 1 = sky (the two
+    # conventions are inverted -- feeding the model mask straight in shows the
+    # sky layer over the foreground, the classic "all ground looks blurred"
+    # symptom, SKILL.md).
+    m = cv2.imread(args.mask, cv2.IMREAD_GRAYSCALE)
+    if m is None:
+        raise SystemExit(f"cannot read --mask {args.mask}")
+    m = cv2.resize(m, (W, H), interpolation=cv2.INTER_LINEAR)
+    w = (m > 127).astype(np.float32)
+    # A model mask boundary is an exact silhouette line, so the feather band
+    # stays narrow: a wide band smears sky glow into the dark foreground
+    # (visible foggy strip).
+    sigma = max(1.0, args.feather)
+    sky_mask = np.clip(cv2.GaussianBlur(1.0 - w, (0, 0), sigma), 0, 1)
+    cov = float(sky_mask.mean())
+    if cov < 0.02 or cov > 0.98:
+        raise SystemExit(f"mask covers almost the whole frame or none of it "
+                         f"(sky {100.0 * cov:.1f}%) -- check the mask polarity "
+                         "(white = ground) and its size")
+    log(f"  mask {args.mask}: ground {100.0 * (1.0 - cov):.1f}% "
+        f"(feather sigma {sigma:g}px)")
+
+    if args.ground_curve == "own":
+        rows = np.flatnonzero(w.max(axis=1) > 0.9)
+        if len(rows) < 64:
+            rows = np.arange(int(H * 0.75), H)
+        _, _, _, gcurve = auto_stretch(
+            ground[rows[0]:rows[-1] + 1],
+            target_bg=args.ground_target_bg, return_params=True)
+        log(f"  ground curve: own MTF (stats over rows {rows[0]}..{rows[-1]}, "
+            f"target_bg {args.ground_target_bg:g})")
+    else:
+        curve = args.curve or os.path.join(
+            os.path.dirname(os.path.abspath(args.sky)), "sky_curve.json")
+        if not os.path.isfile(curve):
+            raise SystemExit(f"missing sky curve: {curve} (pipeline 1 writes "
+                             "sky_curve.json next to sky_final_*.tif)")
+        with open(curve) as f:
+            cj = json.load(f)
+        gcurve = dict(blk=np.asarray(cj["blk"], np.float64),
+                      wht=float(cj["wht"]), m=float(cj["m"]))
+        log(f"  ground curve: sky MTF ({curve})")
+    ygr = np.clip(apply_stretch(ground, gcurve) * args.ground_gain, 0.0, 1.0)
+
+    ys = compose(sky, ygr, sky_mask)
+
+    rng = re.search(r"(\d+)_(\d+)", os.path.basename(args.sky))
+    base = f"merge_final_{rng.group(1)}_{rng.group(2)}" if rng else "merge_final"
+    final_tif = os.path.join(args.out, base + ".tif")
+    final_jpg = os.path.join(args.out, base + ".jpg")
+    write_tiff16(final_tif, (np.clip(ys, 0, 1) * 65535.0 + 0.5).astype(np.uint16))
+    cv2.imwrite(final_jpg,
+                cv2.cvtColor((np.clip(ys, 0, 1) * 255 + 0.5).astype(np.uint8),
+                             cv2.COLOR_RGB2BGR), [cv2.IMWRITE_JPEG_QUALITY, 95])
+
+    cv2.imwrite(os.path.join(args.out, "sky_mask.png"),
+                (np.clip(sky_mask, 0, 1) * 255).astype(np.uint8))
+    disp = cv2.resize((np.clip(ys, 0, 1) * 255 + 0.5).astype(np.uint8),
+                      None, fx=0.5, fy=0.5, interpolation=cv2.INTER_AREA)
+    half = cv2.resize(sky_mask, (disp.shape[1], disp.shape[0]),
                       interpolation=cv2.INTER_AREA)
-    cnts, _ = cv2.findContours((half_mask > 0.5).astype(np.uint8),
+    cnts, _ = cv2.findContours((half > 0.5).astype(np.uint8),
                                cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     cv2.drawContours(disp, cnts, -1, (0, 200, 255), 2)
-    a, b = line
-    if a is not None:
-        h, w = disp.shape[:2]
-        cv2.line(disp, (0, int(round(b))), (w - 1, int(round(a * (w - 1) + b))),
-                 (0, 255, 0), 2)
     cv2.putText(disp, "sky / ground boundary", (15, 40),
                 cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 2)
-    cv2.imwrite(path, cv2.cvtColor(disp, cv2.COLOR_RGB2BGR),
-                [cv2.IMWRITE_JPEG_QUALITY, quality])
-
-
-def run_composite(sky, ground, evidence, out_dir, target_bg=0.20, mode="mask",
-                  feather=25.0, thresh=0.05, min_sky=0.02, preview_scale=0.5,
-                  sky_mask=None):
-    """Write the ground layer + inspection figures, detect the boundary from the
-    sky `evidence` map, composite, and return (composite or None, info dict).
-
-    If `sky_mask` is given (a full-res float mask, 1 = sky) the detection step is
-    skipped and that mask is used instead -- this is how a boundary recognised by
-    a large image model (passed in via ``--ground-mask``) is applied."""
-    write_tiff16(os.path.join(out_dir, "ground_stack.tif"),
-                 np.clip(ground * 65535.0, 0, 65535).astype(np.uint16))
-    prev = cv2.resize(to_u8(auto_stretch(ground, target_bg=target_bg)[0]), None,
-                      fx=preview_scale, fy=preview_scale,
-                      interpolation=cv2.INTER_AREA)
-    cv2.imwrite(os.path.join(out_dir, "ground_stack_preview.jpg"),
-                cv2.cvtColor(prev, cv2.COLOR_RGB2BGR),
-                [cv2.IMWRITE_JPEG_QUALITY, 92])
-
-    if sky_mask is not None:
-        mask = sky_mask
-        info = dict(failed=False, mode="external (model)", slope=None,
-                    intercept=None, inliers=0, coverage=float(mask.mean()))
-    else:
-        mask, info = horizon.detect(evidence, sky.shape[:2], mode=mode, t=thresh,
-                                    feather=feather)
-    if mask is None:
-        log(f"  !! composite: {info.get('reason', 'horizon detection failed')}"
-            " -- skipping sky/ground stitch")
-        return None, info
-    cov = info["coverage"]
-    log(f"  sky/ground boundary ({info['mode']}): coverage={100.0 * cov:.1f}%"
-        + ("" if info["slope"] is None else
-           f", line slope={info['slope']:+.3f} intercept={info['intercept']:.1f}px"
-           f" ({info['inliers']} pts)"))
-    if cov < min_sky or cov > 1.0 - min_sky:
-        log("  !! composite: sky or ground layer is essentially absent "
-            f"(coverage {100.0 * cov:.1f}%) -- keeping the sky stack")
-        return None, info
-
-    comp = compose(sky, ground, mask)
-    cv2.imwrite(os.path.join(out_dir, "sky_mask.png"), to_u8(mask))
-    half_mask = cv2.resize(mask, (evidence.shape[1], evidence.shape[0]),
-                           interpolation=cv2.INTER_AREA)
-    _overlay(comp, half_mask, (info["slope"], info["intercept"]), target_bg,
-             os.path.join(out_dir, "sky_ground_overlay.jpg"))
-    log(f"  sky/ground composite: sky {100.0 * cov:.1f}% / "
-        f"ground {100.0 * (1.0 - cov):.1f}%  (feather {feather:g}px)")
-    return comp, info
+    overlay = os.path.join(args.out, "sky_ground_overlay.jpg")
+    cv2.imwrite(overlay, cv2.cvtColor(disp, cv2.COLOR_RGB2BGR),
+                [cv2.IMWRITE_JPEG_QUALITY, 88])
+    log(f"  composite: sky {100.0 * cov:.1f}% / ground {100.0 * (1.0 - cov):.1f}%")
+    log(f"  wrote {final_tif} + {base}.jpg (full-res)")
+    log(f"  wrote {overlay}  (cyan = mask boundary; verify it follows the ridge)")
+    log(f"done -> {os.path.abspath(args.out)}")

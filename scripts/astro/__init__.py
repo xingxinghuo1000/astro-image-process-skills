@@ -12,7 +12,9 @@ The package splits the pipeline into single-purpose modules so
     neutralize    per-channel sky-background neutralization
     whitebalance  automatic star/sky white balance
     star_reduce   star-mask morphology star shrink
-    composite     sky/ground ("天地") stitch at the detected horizon
+    composite     sky/ground ("天地") composite -- pipeline 2, run by
+                  scripts/composite_ground.py (mask-only boundary; pipeline 1
+                  never stitches)
     render        per-stage TIFF/JPEG, montage and comparison figures
     pipeline      the orchestration that wires the steps together
 """
